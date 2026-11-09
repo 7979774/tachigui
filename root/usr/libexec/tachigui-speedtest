@@ -1,0 +1,136 @@
+#!/bin/sh
+# スピードテストの補助。LuCI (ubus file exec) から呼ばれる。
+#   inet-start [auto|v4] [サーバー番号]  インターネットの速度測定を、バックグラウンドで始める (speedtest-go)。v4 は IPv4 に固定する
+#   inet-check   speedtest-go が入っているか返す
+#   inet-servers  測定に使えるサーバーの一覧を返す
+#   inet-status  実行中か、前回の結果 (JSON) を返す
+#   inet-ip      ルーターの公開 IPv4 (一般の確認サービスから見た値) を返す
+#   lan-prep     LAN の速度測定用の、ダウンロード用ファイル (64 MiB) を /tmp に作る
+#   lan-clean    測定用の一時ファイルを消す
+#   lan-link     LAN ポートのリンク速度を返す
+#   best-get / best-put / best-clear  最高記録を読む・更新する・消す
+D=/tmp
+RES=$D/tachigui-st-inet.json
+PID=$D/tachigui-st-inet.pid
+BIN=$D/tachigui-st-lan.bin
+FAM=$D/tachigui-st-inet.family
+
+BEST=${TACHIGUI_BEST:-/etc/tachigui-speedtest-best.json}     # 最高記録 (再起動しても残す)
+
+running() { [ -f "$PID" ] && kill -0 "$(cat "$PID" 2>/dev/null)" 2>/dev/null; }
+best_val() { [ -s "$BEST" ] && jsonfilter -i "$BEST" -e "@.$1.$2.v" 2>/dev/null; }
+best_at() { [ -s "$BEST" ] && jsonfilter -i "$BEST" -e "@.$1.$2.at" 2>/dev/null; }
+
+case "$1" in
+inet-check)
+	command -v speedtest-go >/dev/null 2>&1 && echo '{"installed":true}' || echo '{"installed":false}'
+	;;
+inet-start)
+	if running; then echo '{"started":false,"running":true}'; exit 0; fi
+	rm -f "$RES" "$RES.tmp" "$FAM"
+	MODE=auto
+	SRC=""
+	if [ "$2" = "v4" ]; then
+		SRC=$(ip -4 addr show dev br-lan 2>/dev/null | awk '/inet /{sub(/\/.*/,"",$2); print $2; exit}')
+		[ -n "$SRC" ] && MODE=v4
+	fi
+	echo "$MODE" > "$D/tachigui-st-inet.mode"
+	# サーバーの指定は番号だけを受け付ける (空なら自動)
+	SV=$3
+	case "$SV" in *[!0-9]*) SV='' ;; esac
+	( speedtest-go --json ${SRC:+--source "$SRC"} ${SV:+--server "$SV"} > "$RES.tmp" 2>/dev/null; if [ -s "$RES.tmp" ]; then mv "$RES.tmp" "$RES"; else echo '{"error":"failed"}' > "$RES"; rm -f "$RES.tmp"; fi; rm -f "$PID" ) >/dev/null 2>&1 &
+	echo $! > "$PID"
+	# 測定に使われた通信 (IPv4 / IPv6) を、測定の途中で、サーバーへの接続から調べる
+	( sleep 13; v6=$(netstat -tn 2>/dev/null | awk '$6=="ESTABLISHED" && $5 ~ /:8080$/ && $5 ~ /:.*:/' | wc -l); v4=$(netstat -tn 2>/dev/null | awk '$6=="ESTABLISHED" && $5 ~ /:8080$/ && $5 !~ /:.*:/' | wc -l); if [ "$v6" -gt "$v4" ]; then echo ipv6 > "$FAM"; else echo ipv4 > "$FAM"; fi ) >/dev/null 2>&1 &
+	echo '{"started":true,"running":true}'
+	;;
+inet-status)
+	if running; then
+		echo '{"running":true}'
+	elif [ -s "$RES" ]; then
+		printf '{"running":false,"mode":"%s","family":"%s","result":%s}\n' "$(cat $D/tachigui-st-inet.mode 2>/dev/null)" "$(cat "$FAM" 2>/dev/null)" "$(cat "$RES")"
+	else
+		echo '{"running":false}'
+	fi
+	;;
+inet-ip)
+	ip=$(uclient-fetch -4 -q -T 6 -O- https://api.ipify.org 2>/dev/null | head -c 45)
+	case "$ip" in *[!0-9.]*|'') ip='';; esac
+	ip6=$(uclient-fetch -6 -q -T 6 -O- https://api6.ipify.org 2>/dev/null | head -c 45)
+	case "$ip6" in *[!0-9a-fA-F:]*|'') ip6='';; esac
+	echo '{"ip":"'"$ip"'","ip6":"'"$ip6"'"}'
+	;;
+lan-prep)
+	[ -s "$BIN" ] || dd if=/dev/zero of="$BIN" bs=1M count=64 2>/dev/null
+	rm -f "$D"/tachigui-st-lan-up.bin
+	echo '{"ok":true,"path":"'"$BIN"'","size":67108864}'
+	;;
+lan-clean)
+	rm -f "$BIN" "$D"/tachigui-st-lan-up.bin
+	echo '{"ok":true}'
+	;;
+inet-servers)
+	# 測定に使えるサーバーの一覧。応答がないものは出さない
+	# 行の形: [48463]      5.83km 6ms 	Tokyo (Japan) by IPA CyberLab 400G
+	speedtest-go --list 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | awk '
+		BEGIN { printf "{\"servers\":[" }
+		/^\[ *[0-9]+\]/ {
+			line = $0
+			if (!match(line, /[0-9]+\]/)) next
+			id = substr(line, RSTART, RLENGTH - 1)
+			rest = substr(line, RSTART + RLENGTH)
+			sub(/^[ \t]+/, "", rest)
+			split(rest, f, /[ \t]+/)
+			km = f[1]; ms = f[2]
+			if (ms !~ /^[0-9]+ms$/) next
+			name = rest
+			sub(/^[^ \t]+[ \t]+[^ \t]+[ \t]+/, "", name)
+			gsub(/["\\]/, "", name)
+			gsub(/[\001-\037]/, " ", name)
+			sub(/km$/, "", km); sub(/ms$/, "", ms)
+			printf "%s{\"id\":\"%s\",\"km\":%d,\"ms\":%d,\"name\":\"%s\"}", (n++ ? "," : ""), id, km + 0.5, ms, name
+		}
+		END { print "]}" }'
+	;;
+best-get)
+	[ -s "$BEST" ] && cat "$BEST" || echo '{}'
+	;;
+best-put)
+	# 最高記録を更新する。引数: inet|lan 下り 上り [測定日時]。下りと上りは別々に比べる
+	case "$2" in inet|lan) ;; *) echo '{"error":"usage"}'; exit 0 ;; esac
+	AT=$(printf '%s' "$5" | tr -cd '0-9: -' | cut -c1-16)
+	[ -n "$AT" ] || AT=$(date '+%Y-%m-%d %H:%M')
+	entry() {   # 種類 方向 新しい値: 大きいほうを {"v":..,"at":".."} で出す
+		ov=$(best_val "$1" "$2"); oa=$(best_at "$1" "$2"); nv=$3
+		case "$nv" in ''|*[!0-9.]*) nv='' ;; esac
+		if [ -n "$nv" ] && awk -v a="$nv" -v b="${ov:-0}" 'BEGIN{exit !(a+0 > b+0)}'; then printf '{"v":%s,"at":"%s"}' "$nv" "$AT"
+		elif [ -n "$ov" ]; then printf '{"v":%s,"at":"%s"}' "$ov" "$oa"
+		else printf 'null'; fi
+	}
+	pair() {    # 種類 下り 上り
+		printf '{"dl":%s,"ul":%s}' "$(entry "$1" dl "$2")" "$(entry "$1" ul "$3")"
+	}
+	if [ "$2" = inet ]; then i=$(pair inet "$3" "$4"); l=$(pair lan '' ''); else i=$(pair inet '' ''); l=$(pair lan "$3" "$4"); fi
+	printf '{"inet":%s,"lan":%s}\n' "$i" "$l" > "$BEST.tmp" && mv "$BEST.tmp" "$BEST"
+	cat "$BEST"
+	;;
+best-clear)
+	mv "$BEST" "$BEST.bak" 2>/dev/null
+	echo '{}'
+	;;
+lan-link)
+	# つながっている LAN ポートと、リンク速度 (Mbps)。無線などの速度がないものは出さない
+	out=''
+	for p in /sys/class/net/br-lan/brif/*; do
+		n=${p##*/}
+		[ "$(cat "/sys/class/net/$n/operstate" 2>/dev/null)" = up ] || continue
+		s=$(cat "/sys/class/net/$n/speed" 2>/dev/null)
+		case "$s" in ''|-*|*[!0-9]*) continue ;; esac
+		out="$out${out:+,}{\"port\":\"$n\",\"speed\":$s}"
+	done
+	echo "{\"links\":[$out]}"
+	;;
+*)
+	echo '{"error":"usage"}'
+	;;
+esac

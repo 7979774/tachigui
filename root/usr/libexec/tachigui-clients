@@ -1,0 +1,108 @@
+#!/usr/bin/ucode
+/*
+ * クライアント画面の補助 (LuCI の file exec から呼ばれる)。JSON を 1 つ出す。
+ *   links    : MAC -> { port: つながっているポート (eth1 など), wifi: 無線なら { band } }
+ *   traffic  : IP -> [ 受信バイト, 送信バイト ] (LAN から見て、下り / 上り)
+ *   uptime   : 速度の計算に使う、秒
+ *   aps      : 連携している AP [ { host, name } ]
+ *   names    : AP の管理画面でつけた端末の名前 { MAC: 名前 }。2 台で違えば、先に登録した台の名前。
+ *              TachiGUI が自動で書いた名前 (機器が名乗った名前。tachigui-apnames の記録と同じもの) は入れない
+ */
+import { readfile, popen, lsdir, access } from 'fs';
+import { connect } from 'ubus';
+
+const BR = '/sys/class/net/br-lan';
+
+function ports() {
+	let m = {};
+	for (let n in (lsdir(BR + '/brif') ?? [])) {
+		let v = trim(readfile(BR + '/brif/' + n + '/port_no') ?? '');
+		if (length(v)) m[hex(v)] = n;
+	}
+	return m;
+}
+
+function hex2(b) {
+	return substr('0123456789abcdef', b >> 4, 1) + substr('0123456789abcdef', b & 15, 1);
+}
+
+/* 連携している AP の一覧 (登録の行があって、鍵もあるもの) */
+function apList() {
+	let res = [];
+	for (let l in split(trim(readfile('/etc/tachigui/wifi-ap') ?? ''), '\n')) {
+		let f = split(trim(l), ' ', 2);
+		if (f[0] && access('/etc/tachigui/ap/' + f[0] + '.key')) push(res, { host: f[0], name: f[1] ?? '' });
+	}
+	return res;
+}
+
+/* 別の AP の Wi-Fi 機器を足す (tachigui-wifi が /tmp に保存した分)。古ければ裏で読み直して、今回は保存済みの分を使う
+   同じ機器が 2 台の AP に見えたら (移る途中など)、電波の強いほうを接続先にする */
+function apClients(res, aps, names) {
+	let stale = false;
+	for (let a in aps) {
+		let w = json(readfile('/tmp/tachigui-wifi-' + a.host + '.json') ?? 'null');
+		let age = time() - (w?.at ?? 0);
+		if (age > 15) stale = true;
+		if (age > 60) continue;      // 古すぎる情報は出さない
+		let auto = json(readfile('/etc/tachigui/ap/' + a.host + '-auto.json') ?? '{}') ?? {};
+		for (let mac in keys(w?.names ?? {})) if (type(w.names[mac]) == 'string' && !names[mac] && w.names[mac] != auto[mac]) names[mac] = w.names[mac];
+		for (let mac in keys(w?.clients ?? {})) {
+			let c = w.clients[mac];
+			if (res[mac]?.wifi?.ap && res[mac].wifi.signal >= c.signal) continue;
+			res[mac] = { port: res[mac]?.port, wifi: { band: c.band, ssid: c.ssid, signal: c.signal, rx: c.rx, tx: c.tx, ap: w.ap } };
+		}
+	}
+	if (stale) system('/usr/libexec/tachigui-wifi refresh </dev/null >/dev/null 2>&1 &');
+}
+
+function links(aps, names) {
+	let res = {}, pm = ports();
+	let raw = readfile(BR + '/brforward', 16 * 1024);
+	for (let i = 0; raw && i + 16 <= length(raw); i += 16) {
+		let b = [];
+		for (let k = 0; k < 16; k++) b[k] = ord(raw, i + k);
+		if (b[7]) continue;                       // 自分 (ルーター) のアドレス
+		let port = b[6] | (b[12] << 8);
+		let mac = join(':', map(slice(b, 0, 6), hex2));
+		if (pm[port]) res[mac] = { port: pm[port] };
+	}
+
+	/* 無線 (hostapd) */
+	let u = connect();
+	if (u) {
+		for (let obj in keys(u.list() ?? {})) {
+			if (!match(obj, /^hostapd\./)) continue;
+			let c = u.call(obj, 'get_clients');
+			let band = (c?.freq ?? 0) < 3000 ? '2.4G' : ((c?.freq ?? 0) < 5900 ? '5G' : '6G');
+			for (let mac in keys(c?.clients ?? {}))
+				res[lc(mac)] = { port: res[lc(mac)]?.port, wifi: { band, ifname: replace(obj, 'hostapd.', '') } };
+		}
+	}
+	apClients(res, aps, names);
+	return res;
+}
+
+function traffic() {
+	let res = {};
+	for (let t in [ [ 'rx4', 0 ], [ 'rx6', 0 ], [ 'tx4', 1 ], [ 'tx6', 1 ] ]) {
+		let name = t[0], idx = t[1];
+		let p = popen('nft -j list set inet tachigui_acct ' + name + ' 2>/dev/null');
+		let text = p ? p.read('all') : null;
+		p?.close();
+		let j = text ? json(text) : null;
+		for (let e in (j?.nftables ?? [])) {
+			for (let el in (e?.set?.elem ?? [])) {
+				let v = el?.elem?.val, c = el?.elem?.counter;
+				if (!v || !c) continue;
+				res[v] ??= [ 0, 0 ];
+				res[v][idx] = c.bytes;
+			}
+		}
+	}
+	return res;
+}
+
+let up = split(trim(readfile('/proc/uptime') ?? '0'), ' ')[0];
+let aps = apList(), names = {};
+print(sprintf('%J', { uptime: +up, links: links(aps, names), traffic: traffic(), aps, names }), '\n');

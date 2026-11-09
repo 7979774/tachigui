@@ -1,0 +1,4 @@
+# 管理用のポート (SSH / HTTP / HTTPS / ttyd) には、リンクローカル以外の IPv6 アドレスから、届かせない。
+# 上流のルーターの防御が無効でも、外 (インターネット) からの IPv6 で、管理画面に届かないようにする。
+# DNS (53) の遮断は、AP モードのときだけ、/usr/libexec/tachigui-ipv6 が別のファイルで入れる。
+meta nfproto ipv6 ip6 saddr != fe80::/10 tcp dport { 22, 80, 443, 7681 } counter drop comment "tachigui-ipv6-guard"

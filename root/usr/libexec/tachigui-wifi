@@ -1,0 +1,319 @@
+#!/bin/sh
+# 別の AP (GL.iNet Slate 7 など) に SSH で聞いて、Wi-Fi 機器の接続先と電波、AP の情報を /tmp に保存する。AP は MAX (8) 台まで登録できる
+#   refresh [アドレス]           読みに行って保存する (AP ごとに同時に 1 つだけ)。アドレスがなければ全台。tachigui-clients から呼ばれる
+#   status                       登録の状態を返す { configured, aps: [ ... ] }
+#   register アドレス 名前        鍵を作って AP に登録する (登録済みのアドレスなら登録し直す)。root パスワードは PW のファイルで受け取り、読んだらすぐ消す
+#   unregister アドレス           その AP の鍵と設定をルーターから消す
+#   wlan get|set アドレス         AP の Wi-Fi の設定を読む / 変える (AP に写した tachigui-wlan を動かす)。set は SET のファイルで受け取る
+#   names set                    端末の名前を全台の管理画面の名前に書く。NSET のファイルで受け取る (読むのは refresh で、機器の情報と一緒に)
+#   names auto                   機器が名乗った名前を、名前のない機器に自動で書く (cron から 5 分ごと。tachigui-apnames が決める)
+# 設定: /etc/tachigui/wifi-ap に 1 行 1 台で「アドレス 名前」。鍵は AP ごとに /etc/tachigui/ap/ に置く。無ければ何もしない。
+# AP 側の鍵は command= で読み取りのコマンドに固定する。無線の名前は機種で違うので (wlan0、phy0-ap0 など)、iwinfo の一覧から読む
+# AP の条件: OpenWrt 系で、SSH (dropbear) に root のパスワードで入れて、iwinfo がある
+# 設定を変える鍵 (アドレス-set.key) は読み取りの鍵と分ける。AP に写した tachigui-wlan だけを動かせる (AP に ucode が要る)
+# 鍵を AP ごとに分けるのは、1 台の連携を解除したとき、その台の鍵だけを消して使えなくするため
+DIR=/etc/tachigui
+CONF=$DIR/wifi-ap
+KDIR=$DIR/ap
+MAX=8
+PW=/tmp/.tachigui-wifi-pw
+MARK=tachigui-readonly
+WMARK=tachigui-wifi-config
+WLAN=/usr/libexec/tachigui-wlan
+APWLAN=/etc/tachigui/wlan
+SET=/tmp/.tachigui-wlan-set
+NSET=/tmp/.tachigui-names-set
+WOPTS="command=\"ucode $APWLAN remote\",no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty"
+OPTS='command="for i in $(iwinfo | sed -n s/\ .*ESSID.*//p); do echo == $i; iwinfo $i info; iwinfo $i assoclist; done 2>/dev/null; echo @@names; uci -q show gl-client 2>/dev/null; echo @@up $(cut -d. -f1 /proc/uptime); echo @@board; ubus call system board 2>/dev/null",no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty'
+
+fail() { rm -f "$PW" "$SET"; printf '{"ok":false,"error":"%s"}\n' "$1"; exit 0; }
+
+# AP ごとのファイルの場所。$1 はアドレス
+use() {
+	HOST=$1
+	KEY=$KDIR/$HOST.key
+	WKEY=$KDIR/$HOST-set.key
+	OUT=/tmp/tachigui-wifi-$HOST.json
+	LOCK=/tmp/.tachigui-wifi-$HOST.lock
+}
+valid() { case "$1" in ''|-*|*[!0-9A-Za-z.:-]*) return 1 ;; esac; }
+# 登録の行から名前を読む。無ければ 1 を返す
+name_of() { NAME=$(awk -v h="$1" '$1 == h { sub(/^[^ ]+ ?/, ""); print; f = 1; exit } END { exit !f }' "$CONF" 2>/dev/null) || return 1; NAME=$(printf '%s' "$NAME" | tr -d '"\\'); }
+hosts() { [ -s "$CONF" ] && awk 'NF { print $1 }' "$CONF"; }
+
+# 時間切れつきで dbclient を動かす (dbclient には接続の時間切れがない)。$1 秒、残りは dbclient の引数
+# 裏で動かすコマンドの標準入力は /dev/null になるので、渡すものは IN のファイルで指定する
+# 認証に失敗しても終了コードが 0 のことがあるので、成否は出力の中身でも確かめる
+run_limited() {
+	lim=$1; shift
+	dbclient "$@" < "${IN:-/dev/null}" &
+	p=$!
+	( sleep "$lim"; kill "$p" 2>/dev/null ) >/dev/null 2>&1 &
+	w=$!
+	wait "$p"; r=$?
+	kill "$w" 2>/dev/null
+	return "$r"
+}
+
+# 1 台を読む。use と name_of のあとで呼ぶ
+refresh_one() {
+	[ -s "$KEY" ] || return 0
+	# 前回が固まって残っていても、次で読み直せるように、古いロックは外す
+	if ! mkdir "$LOCK" 2>/dev/null; then
+		[ -n "$(find "$LOCK" -mmin +1 2>/dev/null)" ] || return 0
+		rm -f "$LOCK/raw"; rmdir "$LOCK" 2>/dev/null; mkdir "$LOCK" 2>/dev/null || return 0
+	fi
+	trap 'rm -f "$LOCK/raw"; rmdir "$LOCK" 2>/dev/null' EXIT
+
+	# 終了コードは見ない。AP に無い wlan を読むと 1 になり、認証に失敗しても 0 のことがあるため。出力の中身で決める
+	run_limited 8 -y -T -i "$KEY" "root@$HOST" >"$LOCK/raw" 2>/dev/null
+	if ! grep -q '^== ' "$LOCK/raw"; then
+		# 読めなかったことを残す (前の結果は使わない)
+		printf '{"at":%s,"ok":false,"ap":"%s","host":"%s","clients":{}}\n' "$(date +%s)" "$NAME" "$HOST" > "$OUT.tmp" && mv "$OUT.tmp" "$OUT"
+		return 0
+	fi
+
+	# 機器の情報 (稼働時間と ubus の system board)。前の版で登録した鍵では読めないので、無ければ出さない
+	UP=$(sed -n 's/^@@up \([0-9][0-9]*\)$/\1/p' "$LOCK/raw")
+	BOARD=$(sed -n '/^@@board$/,$p' "$LOCK/raw" | sed 1d | tr -d '\n')
+	SYS=
+	[ -n "$UP" ] && [ -n "$(jsonfilter -s "$BOARD" -e '@.model' 2>/dev/null)" ] && SYS="{\"uptime\":$UP,\"board\":$BOARD}"
+	# 端末の名前 (GL.iNet の管理画面の名前、uci の gl-client)。{ MAC: 名前 }。前の版で登録した鍵や、GL.iNet 以外では空
+	# uci show の値は '...' で囲まれ、中の ' は '\'' になる。JSON を壊す文字 (\ と ") と制御文字は外す
+	NAMES=$(sed -n '/^@@names$/,/^@@up /p' "$LOCK/raw" | awk -v q="'" '
+		match($0, /^gl-client\.[^.]+\.(mac|alias)=/) {
+			k = substr($0, 1, RLENGTH - 1); v = substr($0, RLENGTH + 1)
+			sec = k; sub(/\.[^.]+$/, "", sec); f = substr(k, length(sec) + 2)
+			gsub(q "\\\\" q q, "\001", v); gsub(q, "", v); gsub("\001", q, v); gsub("[\\\\\"\001-\037]", "", v)
+			if (f == "mac") m[sec] = tolower(v); else a[sec] = v
+		}
+		END { for (x in m) if (a[x] != "" && m[x] ~ /^[0-9a-f:]+$/) printf "%s\"%s\":\"%s\"", (n++ ? "," : ""), m[x], a[x] }')
+
+	sed '/^@@/,$d' "$LOCK/raw" | SYS="$SYS" NAMES="$NAMES" awk -v at="$(date +%s)" -v ap="$NAME" -v host="$HOST" '
+		function flush() { if (mac != "") { printf "%s\"%s\":{\"band\":\"%s\",\"ssid\":\"%s\",\"signal\":%d,\"rx\":%d,\"tx\":%d}", (n++ ? "," : ""), mac, band, ssid, sig, rx, tx; mac = "" } }
+		BEGIN { printf "{\"at\":%s,\"ok\":true,\"ap\":\"%s\",\"host\":\"%s\",\"clients\":{", at, ap, host }
+		/^== / { flush(); band = ""; ssid = ""; next }
+		/ESSID:/ { flush(); s = $0; sub(/^.*ESSID: "?/, "", s); sub(/"?[ \t]*$/, "", s); gsub(/["\\]/, "", s); ssid = s; next }
+		/Channel:/ { if (match($0, /\([0-9.]+ GHz\)/)) { f = substr($0, RSTART + 1, RLENGTH - 6) + 0; band = f < 3 ? "2.4G" : (f < 5.9 ? "5G" : "6G") } next }
+		/^[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:/ { flush(); mac = tolower($1); sig = $2 + 0; rx = 0; tx = 0; next }
+		/^[ \t]*RX:/ { rx = $2 + 0; next }
+		/^[ \t]*TX:/ { tx = $2 + 0; next }
+		END { flush(); printf "},\"names\":{%s}", ENVIRON["NAMES"]; if (ENVIRON["SYS"] != "") printf ",\"sys\":%s", ENVIRON["SYS"]; print "}" }
+	' > "$OUT.tmp" && mv "$OUT.tmp" "$OUT"
+}
+
+refresh() {
+	if [ -n "$1" ]; then
+		valid "$1" && name_of "$1" || return 0
+		use "$1"; refresh_one
+		return 0
+	fi
+	# 全台を同時に読む (1 台が止まっていても、ほかの台を待たせない)
+	for H in $(hosts); do
+		valid "$H" || continue
+		( name_of "$H" && use "$H" && refresh_one ) </dev/null >/dev/null 2>&1 &
+	done
+	wait
+}
+
+# 1 台分の状態。use と name_of のあとで呼ぶ (呼び出し元の $(...) の中で動くので、ここで変数を残しても外に伝わらない)
+ap_status() {
+	OK=false; AT=0; N=0; N2=0; N5=0; N6=0; SYS=
+	if [ -s "$OUT" ]; then
+		AT=$(jsonfilter -i "$OUT" -e '@.at' 2>/dev/null); [ -n "$AT" ] || AT=0
+		# 古すぎる情報は「読めている」としない
+		if [ $((NOW - AT)) -le 60 ] && [ "$(jsonfilter -i "$OUT" -e '@.ok' 2>/dev/null)" = true ]; then
+			OK=true
+			B=$(jsonfilter -i "$OUT" -e '@.clients[*].band' 2>/dev/null)
+			N=$(printf '%s\n' "$B" | grep -c .)
+			N2=$(printf '%s\n' "$B" | grep -c '^2.4G$')
+			N5=$(printf '%s\n' "$B" | grep -c '^5G$')
+			N6=$(printf '%s\n' "$B" | grep -c '^6G$')
+			SYS=$(jsonfilter -i "$OUT" -e '@.sys' 2>/dev/null)
+		fi
+	fi
+	W=false; [ -s "$WKEY" ] && W=true
+	printf '{"host":"%s","name":"%s","ok":%s,"at":%s,"count":%s,"bands":{"2.4G":%s,"5G":%s,"6G":%s},"sys":%s,"write":%s}' "$HOST" "$NAME" "$OK" "$AT" "$N" "$N2" "$N5" "$N6" "${SYS:-null}" "$W"
+}
+
+status() {
+	NOW=$(date +%s); STALE=; L=
+	# 1 分より古い台があれば、その場で読み直す (古い情報は「接続できません」になるため)。全台を同時に読み、止まった台も 8 秒で切る
+	for H in $(hosts); do
+		valid "$H" && name_of "$H" || continue
+		use "$H"
+		[ -s "$KEY" ] || continue
+		A=$(jsonfilter -i "$OUT" -e @.at 2>/dev/null)
+		[ $((NOW - ${A:-0})) -gt 60 ] && { refresh; NOW=$(date +%s); break; }
+	done
+	for H in $(hosts); do
+		valid "$H" && name_of "$H" || continue
+		use "$H"
+		[ -s "$KEY" ] || continue
+		# 古さは、ここで見る (ap_status は $(...) の中で動くため)
+		A=$(jsonfilter -i "$OUT" -e @.at 2>/dev/null)
+		[ $((NOW - ${A:-0})) -gt 15 ] && STALE=1
+		L="$L${L:+,}$(ap_status)"
+	done
+	# 古ければ裏で読み直す (今回は保存済みの分を返す)
+	# 裏の処理が標準出力を持ったままだと、呼び出し元 (rpcd) が 30 秒待って失敗するので、全部の入出力を外す
+	# 「[ ] && ( ) &」と書くと、裏に回るのは && の全体で、その殻が出力を持ったままになる。if の中で ( ) だけを裏に回す
+	if [ -n "$STALE" ]; then ( /usr/libexec/tachigui-wifi refresh </dev/null >/dev/null 2>&1 & ) </dev/null >/dev/null 2>&1; fi
+	if [ -n "$L" ]; then printf '{"configured":true,"aps":[%s]}\n' "$L"; else echo '{"configured":false,"aps":[]}'; fi
+}
+
+# 設定を変える鍵を作って、tachigui-wlan と一緒に AP に登録する。DROPBEAR_PASSWORD が要る。AP に ucode がなければ登録しない
+# AP のファームを更新しても残るように、/etc/tachigui/ を AP の sysupgrade.conf に足す
+register_write() {
+	[ -s "$WKEY" ] || dropbearkey -t ed25519 -f "$WKEY" >/dev/null 2>&1 || return 1
+	chmod 600 "$WKEY"
+	WPUB=$(dropbearkey -y -f "$WKEY" 2>/dev/null | grep '^ssh-ed25519' | cut -d' ' -f1,2)
+	[ -n "$WPUB" ] || return 1
+	# 1 行目が鍵の行、残りがスクリプト。鍵の行が 1 つだけ入ったことを AP に数えさせて確かめる
+	IN=$KDIR/.wlan
+	{ printf '%s %s %s\n' "$WOPTS" "$WPUB" "$WMARK"; cat "$WLAN"; } > "$IN"
+	A=/etc/dropbear/authorized_keys
+	R=$(run_limited 20 -y -T "root@$HOST" "command -v ucode >/dev/null || exit 0; IFS= read -r L && mkdir -p /etc/tachigui && cat > $APWLAN && chmod 755 $APWLAN && { grep -qx /etc/tachigui/ /etc/sysupgrade.conf || echo /etc/tachigui/ >> /etc/sysupgrade.conf; } && touch $A && chmod 600 $A && sed -i '/ $WMARK\$/d' $A && printf '%s\n' \"\$L\" >> $A && grep -c ' $WMARK\$' $A" 2>/dev/null)
+	rm -f "$IN"; IN=
+	[ "$R" = 1 ] || { rm -f "$WKEY" "$WKEY.pub"; return 1; }
+}
+
+# 設定を変える鍵で、AP の tachigui-wlan を動かす。応答が JSON で ok があるものだけを返す
+wlan() {
+	valid "$2" && name_of "$2" || fail 'AP が登録されていません'
+	use "$2"
+	[ -s "$WKEY" ] || { rm -f "$SET"; echo '{"ok":false,"need":"register"}'; exit 0; }
+	case "$1" in
+	get) R=$(run_limited 15 -y -T -i "$WKEY" "root@$HOST" get 2>/dev/null) ;;
+	set)
+		[ -s "$SET" ] || fail '設定がありません'
+		IN=$SET; R=$(run_limited 40 -y -T -i "$WKEY" "root@$HOST" set 2>/dev/null); IN=
+		rm -f "$SET"
+		;;
+	*) fail 'usage' ;;
+	esac
+	[ -n "$(jsonfilter -s "$R" -e '@.ok' 2>/dev/null)" ] || fail 'AP に聞けません'
+	# AP に写した tachigui-wlan が古ければ知らせる (登録し直すと写し直す)
+	V=$(sed -n 's/^const VERSION = \([0-9]*\);$/\1/p' "$WLAN")
+	AV=$(jsonfilter -s "$R" -e '@.v' 2>/dev/null)
+	if [ "$1" = get ] && [ -n "$V" ] && [ -n "$AV" ] && [ "$AV" -lt "$V" ]; then printf '%s\n' "$R" | sed '1s/^{/{"old":true,/'; else printf '%s\n' "$R"; fi
+}
+
+# 機器が名乗った名前 (DHCP のホスト名) を、AP の名前が空か自動の名前の機器に書く。書く差があるときだけ AP につなぐ
+auto_names() {
+	refresh
+	for H in $(hosts); do
+		valid "$H" && name_of "$H" || continue
+		use "$H"
+		[ -s "$WKEY" ] || continue
+		F=$NSET.$HOST
+		/usr/libexec/tachigui-apnames plan "$HOST" > "$F" 2>/dev/null
+		if [ -n "$(jsonfilter -i "$F" -e '@.*' 2>/dev/null)" ]; then
+			IN=$F; R=$(run_limited 15 -y -T -i "$WKEY" "root@$HOST" names-set 2>/dev/null); IN=
+			if [ "$(jsonfilter -s "$R" -e '@.ok' 2>/dev/null)" = true ]; then /usr/libexec/tachigui-apnames commit "$HOST"; ( refresh_one ) </dev/null >/dev/null 2>&1
+			else rm -f "/tmp/.tachigui-apnames-$HOST.json"; logger -t tachigui "$HOST: 機器の名前を AP に書けません"; fi
+		fi
+		rm -f "$F"
+	done
+}
+
+# 端末の名前を、設定を変える鍵がある全台の管理画面の名前に書く。NSET のファイル { MAC: 名前 } で受け取る (空は消す)
+# 書けた台はすぐ読み直す (名前は機器の情報と一緒に読むので)。{ ok, ng: [ 書けなかった台の名前 ] }
+names() {
+	[ "$1" = auto ] && { auto_names; exit 0; }
+	[ "$1" = set ] || fail 'usage'
+	[ -s "$NSET" ] || fail '名前がありません'
+	NG=
+	for H in $(hosts); do
+		valid "$H" && name_of "$H" || continue
+		use "$H"
+		[ -s "$WKEY" ] || continue
+		IN=$NSET; R=$(run_limited 15 -y -T -i "$WKEY" "root@$HOST" names-set 2>/dev/null); IN=
+		if [ "$(jsonfilter -s "$R" -e '@.ok' 2>/dev/null)" = true ]; then ( refresh_one ) </dev/null >/dev/null 2>&1
+		else NG="$NG${NG:+,}\"$NAME\""; fi
+	done
+	rm -f "$NSET"
+	printf '{"ok":true,"ng":[%s]}\n' "$NG"
+}
+
+register() {
+	command -v dbclient >/dev/null 2>&1 || fail 'dropbear の SSH クライアントが必要です'
+	valid "$1" || fail 'アドレスを確かめてください'
+	NEWNAME=$(printf '%s' "$2" | tr -d '"\\\n' | cut -c1-32)
+	[ -n "$NEWNAME" ] || NEWNAME=AP
+	if ! name_of "$1" && [ "$(hosts | wc -l)" -ge "$MAX" ]; then fail "AP は $MAX 台までです"; fi
+	[ -s "$PW" ] || fail 'パスワードを入力してください'
+	DROPBEAR_PASSWORD=$(cat "$PW"); rm -f "$PW"
+	export DROPBEAR_PASSWORD
+	use "$1"
+	mkdir -p "$KDIR" && chmod 700 "$DIR" "$KDIR" || fail '鍵を保存できません'
+	[ -s "$KEY" ] || dropbearkey -t ed25519 -f "$KEY" >/dev/null 2>&1 || fail '鍵を作れません'
+	chmod 600 "$KEY"
+	PUB=$(dropbearkey -y -f "$KEY" 2>/dev/null | grep '^ssh-ed25519' | cut -d' ' -f1,2)
+	[ -n "$PUB" ] || fail '鍵を読めません'
+	# AP 側: 前に登録した行だけを入れ替える (他の鍵には触らない)
+	F=/etc/dropbear/authorized_keys
+	IN=$KDIR/.line
+	printf '%s %s %s\n' "$OPTS" "$PUB" "$MARK" > "$IN"
+	# 行が 1 つだけ入ったことを AP に数えさせて、成否を確かめる
+	R=$(run_limited 15 -y -T "root@$HOST" "touch $F && chmod 600 $F && sed -i '/ $MARK\$/d' $F && cat >> $F && grep -c ' $MARK\$' $F" 2>/dev/null)
+	rm -f "$IN"; IN=
+	[ "$R" = 1 ] || { unset DROPBEAR_PASSWORD; fail 'AP に登録できません。アドレスとパスワードを確かめてください'; }
+	# 設定を変える鍵は、登録できなくても読み取りは使えるので、失敗しても続ける
+	register_write || logger -t tachigui "$HOST: AP の Wi-Fi の設定を変える鍵を登録できません (AP に ucode がない など)"
+	unset DROPBEAR_PASSWORD
+	# 登録の行: 登録済みならその行の名前を変え、無ければ最後に足す (1 行目の AP は、AP の画面の追加機能が使う)
+	if name_of "$HOST"; then
+		awk -v h="$HOST" -v n="$NEWNAME" '$1 == h { print h " " n; next } { print }' "$CONF" > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
+	else
+		echo "$HOST $NEWNAME" >> "$CONF"
+	fi
+	NAME=$NEWNAME
+	rm -f "$OUT"
+	refresh_one
+	trap - EXIT; rm -f "$LOCK/raw"; rmdir "$LOCK" 2>/dev/null
+	# 本当に読めるまで確かめる。読めなければ登録しなかったことにする (前から登録していた台なら、行は残す)
+	if [ "$(jsonfilter -i "$OUT" -e '@.ok' 2>/dev/null)" != true ]; then
+		[ -n "$WAS" ] || { awk -v h="$HOST" '$1 != h' "$CONF" > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"; rm -f "$KEY" "$KEY.pub" "$WKEY" "$WKEY.pub"; }
+		rm -f "$OUT"
+		fail '鍵は送りましたが、AP の情報を読めません'
+	fi
+	W=false; [ -s "$WKEY" ] && W=true
+	status | sed "1s/^{/{\"reg\":{\"host\":\"$HOST\",\"write\":$W},/"
+}
+
+unregister() {
+	valid "$1" || fail 'アドレスを確かめてください'
+	use "$1"
+	rm -f "$KEY" "$KEY.pub" "$WKEY" "$WKEY.pub" "$OUT" "$KDIR/$1-auto.json"
+	[ -s "$CONF" ] && awk -v h="$1" 'NF && $1 != h' "$CONF" > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
+	[ -s "$CONF" ] || rm -f "$CONF"
+	rmdir "$KDIR" "$DIR" 2>/dev/null
+	status
+}
+
+case "$1" in
+refresh)
+	refresh "$2"
+	;;
+status)
+	status
+	;;
+register)
+	WAS=; name_of "$2" && WAS=1
+	register "$2" "$3"
+	;;
+unregister)
+	unregister "$2"
+	;;
+wlan)
+	wlan "$2" "$3"
+	;;
+names)
+	names "$2"
+	;;
+*)
+	echo '{"error":"usage"}'
+	;;
+esac
+exit 0

@@ -1,0 +1,8 @@
+#!/bin/sh
+# 背景の設定と画像を、ログイン前の画面からも読めるようにする。
+# rpcd の file write と cgi-upload は、新しいファイルを 600 で作るので、uhttpd が 403 を返す (mode の指定は効かない)。
+chmod 644 /www/ui/theme.json 2>/dev/null
+for f in /www/ui/bg/user/*; do
+	[ -f "$f" ] && chmod 644 "$f"
+done
+exit 0

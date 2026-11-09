@@ -1,0 +1,52 @@
+#!/usr/bin/ucode
+/*
+ * ファンの回転数を JSON で返す。{ fans: [ { id, rpm } ] }。読めるファンがなければ {} (画面は欄を隠す)。
+ *  1. hwmon (Linux 標準)。ドライバーがある機種は、これで読める
+ *  2. BKHD-1264-SFP は hwmon に出ないので、環境コントローラ IT8784E-I (I/O 0x0a40) を直接読む。
+ *     I/O ポートに書き込むので、機種を確かめてから動かす (別の機種では、別の部品を触ってしまう)
+ *     レジスタ: 回転数カウンタ 8 bit = 0x0d..0x0f, 上位 = 0x18..0x1a,
+ *     16 bit モードの有効化 = 0x13 の bit4..6。rpm = 1350000 / (カウンタ × 2)
+ */
+import { readfile, lsdir, open } from 'fs';
+
+function hwmon() {
+	let fans = [];
+	for (let h in sort(lsdir('/sys/class/hwmon') ?? [])) {
+		for (let f in sort(lsdir('/sys/class/hwmon/' + h) ?? [])) {
+			if (!match(f, /^fan[0-9]+_input$/)) continue;
+			let v = trim(readfile('/sys/class/hwmon/' + h + '/' + f) ?? '');
+			if (length(v)) push(fans, { id: length(fans) + 1, rpm: +v });
+		}
+	}
+	return fans;
+}
+
+function bkhd() {
+	if (trim(readfile('/sys/class/dmi/id/board_name') ?? '') != 'BKHD-1264-SFP') return [];
+	const BASE = 0x0a40;
+	const f = open('/dev/port', 'r+');
+	if (!f) return [];
+	const outb = (port, v) => { f.seek(port); f.write(chr(v)); f.flush(); };
+	const inb = (port) => { f.seek(port); return ord(f.read(1)); };
+	const rd = (r) => { outb(BASE + 5, r); return inb(BASE + 6); };
+
+	const ctl = rd(0x13);
+	const LOW = [ 0x0d, 0x0e, 0x0f ], HIGH = [ 0x18, 0x19, 0x1a ];
+	let fans = [];
+	for (let i = 0; i < 3; i++) {
+		const lo = rd(LOW[i]);
+		let cnt = lo, rpm = 0;
+		if (ctl & (0x10 << i))
+			cnt = (rd(HIGH[i]) << 8) | lo;
+		/* 0 / 全ビット 1 は、ファンなし (信号が来ていない) */
+		if (cnt > 0 && cnt != ((ctl & (0x10 << i)) ? 0xffff : 0xff))
+			rpm = int(1350000 / (cnt * 2));
+		push(fans, { id: i + 1, rpm: rpm });
+	}
+	f.close();
+	return fans;
+}
+
+let fans = hwmon();
+if (!length(fans)) fans = bkhd();
+print(sprintf('%J', length(fans) ? { fans: fans } : {}), '\n');

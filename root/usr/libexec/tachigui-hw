@@ -1,0 +1,40 @@
+#!/usr/bin/ucode
+/*
+ * 機種名と温度を JSON で返す。{ model, temp }。読めないものは null。
+ *  model: OpenWrt の機種名。中身がない (BIOS の初期値のままの) ときは、DMI の基板名や製品名を使う
+ *  temp:  全センサーの最大値 (℃)。hwmon を読み、なければ thermal_zone を読む
+ */
+import { readfile, lsdir } from 'fs';
+
+const rd = p => trim(readfile(p) ?? '');
+const junk = s => !length(s) || !!match(lc(s), /default string|to be filled|not specified|not applicable|system product name/);
+
+function model() {
+	const m = rd('/tmp/sysinfo/model');
+	if (!junk(m)) return m;
+	for (let f in [ 'board_name', 'product_name' ]) {
+		const v = rd('/sys/class/dmi/id/' + f);
+		if (!junk(v)) return v;
+	}
+	return null;
+}
+
+function temps() {
+	let list = [];
+	for (let h in lsdir('/sys/class/hwmon') ?? [])
+		for (let f in lsdir('/sys/class/hwmon/' + h) ?? [])
+			if (match(f, /^temp[0-9]+_input$/)) push(list, rd('/sys/class/hwmon/' + h + '/' + f));
+	if (!length(list))
+		for (let z in lsdir('/sys/class/thermal') ?? [])
+			if (match(z, /^thermal_zone/)) push(list, rd('/sys/class/thermal/' + z + '/temp'));
+	return list;
+}
+
+function maxTemp() {
+	let max = null;
+	for (let v in temps())
+		if (length(v) && (max == null || +v > max)) max = +v;
+	return max == null ? null : max / 1000.0;
+}
+
+print(sprintf('%J', { model: model(), temp: maxTemp() }), '\n');

@@ -1,0 +1,174 @@
+#!/usr/bin/ucode
+/*
+ * AP モード (WAN なし) のルーター自身に、上流のルーターから IPv6 アドレスを受け取らせる。
+ *   status   状態を JSON で返す (アドレス・経路・設定)
+ *   set on|off   設定を保存して、すぐ反映する
+ *   renew    ルーター広告 (RA) を、もう一度受け取る
+ *   test     IPv6 の疎通を調べる (ping6 と、公開 IPv6)
+ *   apply    設定を反映する (起動時・LAN 起動時に、hotplug から)
+ */
+import * as fs from 'fs';
+import { cursor } from 'uci';
+import { connect } from 'ubus';
+
+const cmd = ARGV[0] ?? 'status';
+const uci = cursor();
+
+function sh(c) {
+	const p = fs.popen(c + ' 2>/dev/null', 'r');
+	if (!p)
+		return '';
+	const out = p.read('all');
+	p.close();
+	return out ?? '';
+}
+
+function lan_dev() {
+	const u = connect();
+	const st = u ? u.call('network.interface.lan', 'status') : null;
+	return (st && (st.l3_device ?? st.device)) ?? 'br-lan';
+}
+
+function ap_mode() {
+	uci.load('network');
+	/* WAN も、v6プラス (map0) も、DS-Lite も、WAN 側の IPv6 (wan6) も、なければ、ブリッジ (AP) モード */
+	return uci.get('network', 'wan', 'proto') == null && uci.get('network', 'wan6', 'proto') == null && uci.get('network', 'map0', 'proto') == null && uci.get('network', 'dslite0', 'proto') == null;
+}
+
+function enabled() {
+	uci.load('tachigui');
+	return (uci.get('tachigui', 'main', 'enabled') ?? '1') != '0';
+}
+
+function write_conf(on) {
+	uci.load('tachigui');
+	if (uci.get('tachigui', 'main') == null)
+		uci.set('tachigui', 'main', 'ipv6');
+	uci.set('tachigui', 'main', 'enabled', on ? '1' : '0');
+	uci.save('tachigui');
+	uci.commit('tachigui');
+}
+
+function sysw(dev, name, val) {
+	fs.writefile('/proc/sys/net/ipv6/conf/' + dev + '/' + name, val);
+}
+
+function sysr(dev, name) {
+	return trim(fs.readfile('/proc/sys/net/ipv6/conf/' + dev + '/' + name) ?? '');
+}
+
+/* DNS (53) への、リンクローカル以外の IPv6 からの問い合わせを遮断する。AP モードのときだけ必要:
+   Unbound は、全アドレスからの問い合わせに答える設定で、上位のルーターから届く外部の通信が、LAN 側の入力に来るため。
+   ルーターモードでは、外部の通信は WAN 側で拒否され、LAN の端末は、IPv6 の DNS を使うため、遮断しない。 */
+const DNSF = '/usr/share/nftables.d/chain-pre/input_lan/51-tachigui-ipv6-dns.nft';
+const DNS_RULE = '# tachigui-ipv6: AP モードのとき、リンクローカル以外の IPv6 から、DNS (53) に届かせない\n' +
+	'meta nfproto ipv6 ip6 saddr != fe80::/10 tcp dport 53 counter drop comment "tachigui-ipv6-guard-dns"\n' +
+	'meta nfproto ipv6 ip6 saddr != fe80::/10 udp dport 53 counter drop comment "tachigui-ipv6-guard-dns"\n';
+
+function dns_guard(want) {
+	const has = fs.access(DNSF);
+	if (want == has)
+		return;
+	if (want) {
+		system('mkdir -p /usr/share/nftables.d/chain-pre/input_lan');
+		fs.writefile(DNSF, DNS_RULE);
+	}
+	else
+		fs.unlink(DNSF);
+	system('/sbin/fw4 reload >/dev/null 2>&1');
+}
+
+/* 反映する。kick なら、ルーター要請 (RS) を送り直すため、IPv6 を一度切って入れ直す */
+function apply(kick) {
+	const ap = ap_mode();
+	dns_guard(ap);
+	if (!ap) {
+		/* ルーターモード: LAN の側から来る RA (Slate 7 など) は、受け入れない。LAN の機器が、IPv6 の出口として、選ばれてしまうため */
+		const d = lan_dev();
+		if (sysr(d, 'accept_ra') != '0') {
+			sysw(d, 'accept_ra', '0');
+			system('ip -6 route flush proto ra dev ' + d + ' >/dev/null 2>&1');
+		}
+		return;
+	}
+	const dev = lan_dev();
+	const want = enabled() ? '2' : '0';
+	const changed = sysr(dev, 'accept_ra') != want;
+	sysw(dev, 'accept_ra', want);
+	if (changed || kick) {
+		sysw(dev, 'disable_ipv6', '1');
+		sysw(dev, 'disable_ipv6', '0');
+	}
+}
+
+function status() {
+	const dev = lan_dev();
+	const out = { dev: dev, ap_mode: ap_mode(), enabled: enabled(), accept_ra: sysr(dev, 'accept_ra'), addrs: [], routes: [] };
+
+	for (let line in split(sh('ip -6 addr show dev ' + dev), '\n')) {
+		const m = match(line, /inet6 ([0-9a-f:]+)\/([0-9]+) scope ([a-z]+)(.*)$/);
+		if (!m)
+			continue;
+		const rest = m[4] ?? '';
+		const a = { addr: m[1], plen: +m[2], scope: m[3], dynamic: index(rest, 'dynamic') >= 0, tentative: index(rest, 'tentative') >= 0, deprecated: index(rest, 'deprecated') >= 0 };
+		/* /64 で、省略のない形のときだけ、プレフィックスを出す */
+		if (a.plen == 64 && a.scope == 'global') {
+			const g = split(a.addr, ':');
+			if (length(g) == 8 && index(a.addr, '::') < 0)
+				a.prefix = join(':', slice(g, 0, 4)) + '::/64';
+		}
+		push(out.addrs, a);
+	}
+
+	for (let line in split(sh('ip -6 route show default'), '\n')) {
+		const m = match(line, /default via ([0-9a-f:]+) dev ([^ ]+)(.*)$/);
+		if (!m)
+			continue;
+		const e = match(m[3] ?? '', /expires ([0-9]+)sec/);
+		const r = { via: m[1], dev: m[2], expires: e ? +e[1] : null };
+		const n = match(sh('ip -6 neigh show ' + m[1] + ' dev ' + m[2]), /lladdr ([0-9a-f:]+)/);
+		if (n)
+			r.mac = n[1];
+		push(out.routes, r);
+	}
+
+	print(sprintf('%J', out) + '\n');
+}
+
+function test() {
+	const res = { sent: 3, recv: 0, avg: null, public: null };
+	const o = sh('ping -6 -c3 -W2 2001:4860:4860::8888');
+	const r = match(o, /([0-9]+) packets received/);
+	if (r)
+		res.recv = +r[1];
+	const a = match(o, /= [0-9.]+\/([0-9.]+)\//);
+	if (a)
+		res.avg = +a[1];
+	const ip = trim(sh('uclient-fetch -q -T 6 -O- https://api6.ipify.org'));
+	if (match(ip, /^[0-9a-f:]+$/))
+		res.public = ip;
+	print(sprintf('%J', res) + '\n');
+}
+
+switch (cmd) {
+case 'status':
+	status();
+	break;
+case 'set':
+	write_conf(ARGV[1] != 'off');
+	apply(false);
+	print('{"ok":true}\n');
+	break;
+case 'renew':
+	apply(true);
+	print('{"ok":true}\n');
+	break;
+case 'test':
+	test();
+	break;
+case 'apply':
+	apply(false);
+	break;
+default:
+	print('{"error":"usage"}\n');
+}

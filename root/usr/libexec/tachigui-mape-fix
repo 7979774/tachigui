@@ -1,0 +1,50 @@
+#!/bin/sh
+# 回線のプレフィックスが変わったら、MAP-E の設定を、作り直す。
+# MAP-E の自分のアドレス (IPv4 とポート) は、プレフィックスから計算するので、プレフィックスが変わると、
+# それまでの設定のままでは、黙って、つながらなくなる。
+#   - map0 が使っているプレフィックス (/tmp/map-map0.rules) と、いまの回線のプレフィックスを、比べる。
+#   - 違えば、ルール表で判定し直して、変わっていれば、設定を直して、map0 を起こし直す。
+# 呼ばれる場所: WAN の ifup / ifupdate (hotplug)、5 分ごとの cron、手で実行しても良い。
+
+IF=map0
+LOCK=/tmp/tachigui-mape-fix.lock
+log() { logger -t tachigui-mape-fix "$*"; }
+
+[ "$(uci -q get network.$IF.proto)" = "map" ] || exit 0
+
+# 同時に、2 つは、動かさない
+mkdir "$LOCK" 2>/dev/null || { [ -n "$(find "$LOCK" -mmin +3 2>/dev/null)" ] && rmdir "$LOCK" 2>/dev/null; exit 0; }
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+
+TL=$(uci -q get network.$IF.tunlink); TL=${TL:-wan6}
+ST=$(ubus call network.interface.$TL status 2>/dev/null) || exit 0
+[ "$(echo "$ST" | jsonfilter -e '@.up')" = "true" ] || exit 0
+
+ADDR=$(echo "$ST" | jsonfilter -e '@["ipv6-prefix"][0].address')
+MASK=$(echo "$ST" | jsonfilter -e '@["ipv6-prefix"][0].mask')
+[ -n "$ADDR" ] && [ -n "$MASK" ] || exit 0
+
+USED=$(sed -n 's/^RULE_[0-9]*_IPV6PD=//p' /tmp/map-$IF.rules 2>/dev/null | head -1)
+UP=$(ubus call network.interface.$IF status 2>/dev/null | jsonfilter -e '@.up')
+
+# 起きていて、使っているプレフィックスが同じなら、何もしない
+[ "$UP" = "true" ] && [ "$USED" = "$ADDR" ] && exit 0
+
+# ルール表で、判定し直す
+INFO=$(ubus call tachigui.network lookup "{\"prefix\":\"$ADDR/$MASK\"}" 2>/dev/null)
+[ "$(echo "$INFO" | jsonfilter -e '@.ok')" = "true" ] || { log "ルールを判定できません ($ADDR/$MASK)"; exit 0; }
+
+CHANGED=0
+for pair in peeraddr:peeraddr ipaddr:ipaddr ip4prefixlen:ip4prefixlen ip6prefix:ip6prefix ip6prefixlen:ip6prefixlen ealen:ealen psidlen:psidlen offset:offset; do
+	opt=${pair%%:*}; key=${pair##*:}
+	new=$(echo "$INFO" | jsonfilter -e "@.map.$key")
+	[ -n "$new" ] || continue
+	[ "$(uci -q get network.$IF.$opt)" = "$new" ] || { uci set network.$IF.$opt="$new"; CHANGED=1; }
+done
+[ "$CHANGED" = 1 ] && { uci commit network; log "ルールが変わったので、設定を直しました (プレフィックス $ADDR/$MASK)"; }
+
+log "MAP-E を作り直します (以前 ${USED:--} → いま $ADDR)"
+ifdown $IF >/dev/null 2>&1
+sleep 2
+ifup $IF >/dev/null 2>&1
+exit 0

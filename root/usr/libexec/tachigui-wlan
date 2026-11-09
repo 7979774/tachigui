@@ -1,0 +1,266 @@
+#!/usr/bin/ucode
+// Wi-Fi の設定を読み書きする。JSON を返す。ルーター本体と、連携した AP (このファイルを AP に写す) の両方で動く
+//   get          帯域ごとの設定を返す
+//   set ファイル  ファイルの JSON のとおりに変える (読んだら消す)。{ radios: [ { device, enabled, ssid, ... } ] }
+//   remote       AP の鍵の command= から呼ぶ。操作 (get / set / names-set) は SSH_ORIGINAL_COMMAND で受け取り、set と names-set は標準入力で受け取る
+//                names-set は端末の名前 { MAC: 名前 } を GL.iNet の管理画面の名前に書く (読むのは読み取りの鍵で、機器の情報と一緒に)
+// GL.iNet のファームは独自の API (gl-session の wifi) で読み書きする。uci を直接書くと、GL.iNet の管理画面と値が食い違うため
+// AP の ucode は古い版 (OpenWrt 23.05) のことがあるので、新しい書き方 (?. など) は使わない
+'use strict';
+import { cursor } from 'uci';
+import { connect } from 'ubus';
+import { readfile, unlink, stdin } from 'fs';
+
+const VERSION = 2;
+const BANDS = { '2g': '2.4G', '5g': '5G', '6g': '6G', '60g': '60G' };
+const TXGL = [ [ 'Max', '最大' ], [ 'High', '高' ], [ 'Medium', '中' ], [ 'Low', '低' ] ];
+const ENC = [ 'none', 'psk2', 'psk-mixed', 'sae', 'sae-mixed' ];
+
+let bus = connect();
+const out = o => print(sprintf('%J\n', o));
+const fail = t => { out({ ok: false, error: t }); exit(0); };
+const isGL = () => bus && type(bus.list('gl-session')) == 'array' && length(bus.list('gl-session')) > 0;
+
+// GL.iNet の API。応答は { res: ... } で、失敗は err_code と err_msg
+function glcall(func, params, mod) {
+	let r = bus.call('gl-session', 'call', { module: mod || 'wifi', func: func, params: params || {} });
+	let x = r && r.result;
+	if (!x || x.err_msg || x.err_code) return { err: (x && x.err_msg) || ('gl-session ' + func + ' に失敗しました') };
+	return x;
+}
+
+// 帯域幅の一覧。GL.iNet はモードごとの最大の幅だけを返すので、20 MHz まで半分ずつ並べる (GL.iNet の画面と同じ作り)
+function glWidths(r) {
+	let by = {};
+	for (let m in r.htmodes) {
+		if (m == 'auto') continue;
+		let w = [];
+		for (let x = +r.htmodes[m]; x >= 20; x = x / 2) unshift(w, '' + x);
+		if (r.htmodes.auto) push(w, 'auto');
+		by[m] = w;
+	}
+	return by;
+}
+
+function glGet() {
+	let x = glcall('get_config');
+	if (x.err) fail(x.err);
+	let radios = [];
+	for (let r in x.res) {
+		let f = null;
+		for (let i in r.ifaces) if (!i.guest) { f = i; break; }
+		if (!f) continue;
+		push(radios, {
+			device: r.device, band: BANDS[lc(r.band)] || r.band, iface: f.name,
+			enabled: !!f.enabled, ssid: f.ssid, key: f.key || '', encryption: f.encryption, encryptions: r.encryptions || ENC,
+			hidden: !!f.hidden, channel: +r.channel || 0,
+			channels: map(r.channels || [], c => ({ ch: c.channel, dfs: !!c.dfs })),
+			width: '' + r.htmode, widthsBy: glWidths(r), mode: r.hwmode, modes: r.hwmodes || [],
+			txpower: r.txpower, txpowers: TXGL, random_bssid: r.random_bssid
+		});
+	}
+	return radios;
+}
+
+// 普通の OpenWrt: uci の wireless と iwinfo から読む。電波の機器が見つからない無線 (ドライバーがない など) は出さない
+const htWidth = m => +(match(m || '', /[0-9]+$/) || [ 0 ])[0];
+function phyOf(sec) {
+	let r = bus.call('iwinfo', 'phyname', { section: sec });
+	return r && r.phyname;
+}
+
+function owrtRadios(c) {
+	let radios = [];
+	c.foreach('wireless', 'wifi-device', d => {
+		let phy = phyOf(d['.name']);
+		if (!phy) return;
+		// 帯域ごとに 1 つ: LAN につながる AP を優先する (ゲスト用などは今は出さない)
+		let f = null;
+		c.foreach('wireless', 'wifi-iface', i => {
+			if (i.device != d['.name'] || i.mode != 'ap') return;
+			let nets = type(i.network) == 'array' ? i.network : split(i.network || '', ' ');
+			if (!f || (index(nets, 'lan') >= 0 && f.lan == false)) f = { s: i, lan: index(nets, 'lan') >= 0 };
+		});
+		if (!f) return;
+		push(radios, { d: d, i: f.s, phy: phy });
+	});
+	return radios;
+}
+
+function owrtGet() {
+	let c = cursor();
+	let sae = system('hostapd -vsae >/dev/null 2>&1') == 0 || system('wpad -vsae >/dev/null 2>&1') == 0;
+	let radios = [];
+	for (let x in owrtRadios(c)) {
+		let d = x.d, i = x.i;
+		let info = bus.call('iwinfo', 'info', { device: x.phy }) || {};
+		let fl = bus.call('iwinfo', 'freqlist', { device: x.phy }) || {};
+		let tl = bus.call('iwinfo', 'txpowerlist', { device: x.phy }) || {};
+		let band = d.band || (d.hwmode == '11a' ? '5g' : '2g');
+		// 帯域に合う周波数だけを並べる。5 GHz の 52〜144 は DFS (気象レーダーを避けるため、使い始めるまで待つ)
+		let chs = [];
+		for (let f in fl.results || []) {
+			let ok = band == '2g' ? f.mhz < 3000 : band == '5g' ? f.mhz > 4900 && f.mhz < 5900 : band == '6g' ? f.mhz > 5925 && f.mhz < 7200 : true;
+			if (ok && !f.restricted) push(chs, { ch: f.channel, dfs: band == '5g' && f.channel >= 52 && f.channel <= 144 });
+		}
+		let ws = {};
+		for (let m in info.htmodes || []) { let w = htWidth(m); if (w && !(band == '2g' && w > 40)) ws['' + w] = true; }
+		let widths = sort(keys(ws), (a, b) => +a - +b);
+		let tx = [ TXGL[0] ];
+		for (let t in tl.results || []) push(tx, [ '' + t.dbm, t.dbm + ' dBm' ]);
+		let cur = d.txpower ? '' + d.txpower : 'Max';
+		if (cur != 'Max' && !length(filter(tx, t => t[0] == cur))) push(tx, [ cur, cur + ' dBm' ]);
+		let enc = split(i.encryption || 'none', '+')[0];
+		push(radios, {
+			device: d['.name'], band: BANDS[band] || band, iface: i['.name'],
+			enabled: d.disabled != '1' && i.disabled != '1', ssid: i.ssid || '', key: i.key || '', encryption: enc,
+			encryptions: filter(ENC, e => sae || index(e, 'sae') < 0), hidden: i.hidden == '1',
+			channel: d.channel == 'auto' || !d.channel ? 0 : +d.channel, channels: chs,
+			width: '' + (htWidth(d.htmode) || ''), widthsBy: { '': widths }, mode: '', modes: [],
+			txpower: cur, txpowers: tx
+		});
+	}
+	return radios;
+}
+
+// 送られた値を、読み取った一覧と照らして確かめる。一覧にない値は書かない
+function check(r, w) {
+	let ssid = w.ssid;
+	if (type(ssid) != 'string' || !length(ssid) || length(ssid) > 32) return 'Wi-Fi 名は 1〜32 バイト';
+	if (index(r.encryptions, w.encryption) < 0) return 'セキュリティの値が正しくありません';
+	if (w.encryption != 'none') {
+		let k = w.key;
+		if (type(k) != 'string' || !(match(k, /^[\x20-\x7e]{8,63}$/) || match(k, /^[0-9A-Fa-f]{64}$/))) return 'パスワードは 8〜63 文字 (英数字と記号)';
+	}
+	if (w.channel != 0 && !length(filter(r.channels, c => c.ch == w.channel))) return 'チャネルの値が正しくありません';
+	let mode = r.modes && length(r.modes) ? w.mode : '';
+	if (length(r.modes) && index(r.modes, mode) < 0) return 'Wi-Fi モードの値が正しくありません';
+	let ws = r.widthsBy[mode] || [];
+	if (w.width != r.width && index(ws, w.width) < 0) return '帯域幅の値が正しくありません';
+	if (!length(filter(r.txpowers, t => t[0] == w.txpower))) return '送信電力の値が正しくありません';
+	return null;
+}
+
+const same = (r, w, ks) => length(filter(ks, k => r[k] != w[k])) == 0;
+
+function glSet(list) {
+	let cur = glGet();
+	for (let w in list) {
+		let r = null;
+		for (let x in cur) if (x.device == w.device) r = x;
+		if (!r) return w.device + ' が見つかりません';
+		let e = check(r, w);
+		if (e) return r.band + ': ' + e;
+	}
+	for (let w in list) {
+		let r = null;
+		for (let x in cur) if (x.device == w.device) r = x;
+		// オンオフは、GL.iNet の画面と同じく、ほかの値とは別に送る
+		if (!w.enabled) { if (r.enabled) { let x = glcall('set_config', { iface_name: r.iface, enabled: false }); if (x.err) return x.err; } continue; }
+		if (!r.enabled) { let x = glcall('set_config', { iface_name: r.iface, enabled: true }); if (x.err) return x.err; }
+		if (same(r, w, [ 'ssid', 'key', 'encryption', 'hidden', 'channel', 'width', 'txpower', 'mode' ])) continue;
+		let p = { iface_name: r.iface, ssid: w.ssid, encryption: w.encryption, hidden: !!w.hidden, device: r.device, hwmode: w.mode,
+			channel: +w.channel, htmode: w.width, txpower: w.txpower, random_bssid: r.random_bssid };
+		if (w.encryption != 'none') p.key = w.key;
+		let x = glcall('set_config', p);
+		if (x.err) return x.err;
+	}
+	return null;
+}
+
+// 幅に合う htmode を選ぶ。今の方式 (HE など) で使えればそのまま、使えなければ新しい方式から順に探す
+function htmodeFor(phy, curmode, width) {
+	let info = bus.call('iwinfo', 'info', { device: phy }) || {};
+	let have = info.htmodes || [];
+	let fam = replace(curmode || '', /[0-9]+$/, '');
+	if (fam && index(have, fam + width) >= 0) return fam + width;
+	for (let f in [ 'EHT', 'HE', 'VHT', 'HT' ]) if (index(have, f + width) >= 0) return f + width;
+	return null;
+}
+
+function owrtSet(list) {
+	let cur = owrtGet();
+	let c = cursor();
+	let rs = owrtRadios(c);
+	for (let w in list) {
+		let r = null;
+		for (let x in cur) if (x.device == w.device) r = x;
+		if (!r) return w.device + ' が見つかりません';
+		let e = check(r, w);
+		if (e) return r.band + ': ' + e;
+	}
+	for (let w in list) {
+		let r = null, x = null;
+		for (let y in cur) if (y.device == w.device) r = y;
+		for (let y in rs) if (y.d['.name'] == w.device) x = y;
+		let d = r.device, i = r.iface;
+		if (w.enabled) { c.delete('wireless', d, 'disabled'); c.delete('wireless', i, 'disabled'); }
+		else c.set('wireless', i, 'disabled', '1');
+		c.set('wireless', i, 'ssid', w.ssid);
+		c.set('wireless', i, 'encryption', w.encryption);
+		if (w.encryption == 'none') c.delete('wireless', i, 'key'); else c.set('wireless', i, 'key', w.key);
+		if (w.hidden) c.set('wireless', i, 'hidden', '1'); else c.delete('wireless', i, 'hidden');
+		c.set('wireless', d, 'channel', w.channel ? '' + w.channel : 'auto');
+		if (w.width != r.width) { let m = htmodeFor(x.phy, x.d.htmode, w.width); if (m) c.set('wireless', d, 'htmode', m); }
+		if (w.txpower == 'Max') c.delete('wireless', d, 'txpower'); else c.set('wireless', d, 'txpower', w.txpower);
+	}
+	c.commit('wireless');
+	// 呼び出し元 (rpcd や SSH) を待たせないよう、入出力を外して裏で読み直す
+	system('( sleep 1; wifi reload ) </dev/null >/dev/null 2>&1 &');
+	return null;
+}
+
+function get() {
+	let gl = isGL();
+	out({ ok: true, v: VERSION, kind: gl ? 'gl' : 'owrt', radios: gl ? glGet() : owrtGet() });
+}
+
+function set(text) {
+	let j = null;
+	try { j = json(text || ''); } catch (e) { fail('送られた設定を読めません'); }
+	if (!j || type(j.radios) != 'array' || !length(j.radios)) fail('変える帯域がありません');
+	let e = isGL() ? glSet(j.radios) : owrtSet(j.radios);
+	if (e) fail(e);
+	out({ ok: true });
+}
+
+// 制御文字を捨てて、n 文字で切る。substr はバイトで数えるので、日本語の途中で切れないよう UTF-8 の先頭バイトを数える
+// (正規表現には NUL を書けないので、1 バイトずつ見る)
+function clean(s, n) {
+	let o = '', c = 0;
+	for (let i = 0; i < length(s); i++) {
+		let b = ord(s, i);
+		if (b < 0x20 || b == 0x7f) continue;
+		if ((b & 0xC0) != 0x80) { if (c == n) break; c++; }
+		o += chr(b);
+	}
+	return o;
+}
+const isMac = m => type(m) == 'string' && match(lc(m), /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/);
+
+// 名前を変える。{ MAC: 名前 } で、空の名前は消す。管理画面と同じ API で書く (uci を直接書くと、画面の一覧と食い違うため)
+function namesSet(text) {
+	if (length(text || '') > 65536) fail('名前が多すぎます');
+	let j = null;
+	try { j = json(text || ''); } catch (e) { fail('名前を読めません'); }
+	if (type(j) != 'object') fail('名前を読めません');
+	if (!isGL()) { out({ ok: true, skip: true }); return; }
+	let n = 0;
+	for (let mac in j) {
+		if (!isMac(mac) || type(j[mac]) != 'string') continue;
+		// GL.iNet は " か , を含む名前を、何も言わずに捨てるので、先に外す
+		let r = glcall('set_info', { mac: uc(mac), alias: replace(clean(j[mac], 64), /[",]/g, '') }, 'clients');
+		if (r.err) fail(uc(mac) + ': ' + r.err);
+		n++;
+	}
+	out({ ok: true, count: n });
+}
+
+if (!bus) fail('ubus につながりません');
+let cmd = ARGV[0];
+if (cmd == 'remote') cmd = getenv('SSH_ORIGINAL_COMMAND');
+if (cmd == 'get') get();
+else if (cmd == 'names-set' && ARGV[0] == 'remote') namesSet(stdin.read(65537));
+else if (cmd == 'set' && ARGV[0] == 'remote') set(stdin.read('all'));
+else if (cmd == 'set' && ARGV[1]) { let t = readfile(ARGV[1]); unlink(ARGV[1]); set(t); }
+else fail('usage');

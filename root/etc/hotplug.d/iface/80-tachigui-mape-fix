@@ -1,0 +1,10 @@
+#!/bin/sh
+# WAN 側 (wan6) の状態が、変わったら、少し待ってから、MAP-E の整合を、確かめる
+[ "$INTERFACE" = "wan6" ] || exit 0
+case "$ACTION" in
+ifup|ifupdate) ;;
+*) exit 0 ;;
+esac
+[ -x /usr/libexec/tachigui-mape-fix ] || exit 0
+( sleep 5; /usr/libexec/tachigui-mape-fix ) >/dev/null 2>&1 &
+exit 0

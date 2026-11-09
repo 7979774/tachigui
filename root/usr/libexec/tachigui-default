@@ -1,0 +1,21 @@
+#!/bin/sh
+# http(s)://<ルーター>/ を開いたときの行き先を切り替える: on = TachiGUI (/ui/)、off = LuCI
+IDX=/www/index.html
+MARK=/etc/tachigui.default
+
+# 入口 (/) に、TachiGUI そのものを、置く。http://<ルーター>/#/internet のように、開ける
+page() {
+	sed -e 's#href="app.css#href="ui/app.css#' -e 's#src="js/#src="ui/js/#' /www/ui/app.html
+}
+
+case "$1" in
+on)  [ -f "$IDX.luci" ] || cp "$IDX" "$IDX.luci"; page > "$IDX"; touch "$MARK" ;;
+off) [ -f "$IDX.luci" ] && cp "$IDX.luci" "$IDX"; rm -f "$MARK" ;;
+reapply) [ -f "$MARK" ] && [ -f /www/ui/app.html ] && {
+	# LuCI の更新で元に戻っていたら、控えを取り直す
+	grep -Eq 'ui/js/app.js|URL=ui/' "$IDX" || cp "$IDX" "$IDX.luci"
+	page > "$IDX"
+} ;;
+*) [ -f "$MARK" ] && echo on || echo off ;;
+esac
+exit 0

@@ -1,0 +1,452 @@
+#!/usr/bin/ucode
+/*
+ * セキュリティ画面の補助 (LuCI の file exec から呼ばれる)。
+ *   status                     診断に使う情報を JSON で返す
+ *   set <項目> <値>            設定を変えて、反映する
+ *       ssh_password on|off        SSH のパスワード認証 (鍵が 1 つもないときは、off にしない)
+ *       ssh_root_password on|off   root のパスワード認証
+ *       ssh_lan_only on|off        SSH を LAN の側だけで待ち受ける
+ *       https_redirect on|off      HTTP を HTTPS に転送する
+ *       ttyd on|off                ウェブ端末 (ttyd) を起動 / 停止 (自動起動も)
+ *       session_time <秒>          LuCI のログインの有効時間
+ *       ssh_enable on|off          SSH (dropbear) を動かす / 止める
+ *       ssh_port <番号>            SSH のポート
+ *       http_ports <HTTP>:<HTTPS>  管理画面のポート (例: 80:443)
+ *       wan_ping on|off            WAN 側からの PING (IPv4) に答える
+ *       wan_ipsec on|off           IPsec (ESP / ISAKMP) を、家の中の機器に通す
+ *   fwd-add <名前> <tcp|udp|tcpudp> <外側のポート> <転送先アドレス> <転送先のポート>   ポート転送 (IPv4 は DNAT、IPv6 は許可)
+ *   fwd-del <名前>             ポート転送の規則を消す
+ *   key-add <公開鍵>           authorized_keys に追加する
+ *   key-del <番号>             authorized_keys から消す (パスワード認証が無効なとき、最後の 1 つは消せない)
+ */
+import * as fs from 'fs';
+import { cursor } from 'uci';
+
+const AK = '/etc/dropbear/authorized_keys';
+const cmd = ARGV[0] ?? 'status';
+const uci = cursor();
+
+function sh(c) {
+	const p = fs.popen(c + ' 2>/dev/null', 'r');
+	if (!p)
+		return '';
+	const out = p.read('all');
+	p.close();
+	return out ?? '';
+}
+
+function out(o) { print(sprintf('%J', o) + '\n'); }
+function fail(msg) { out({ ok: false, error: msg }); exit(0); }
+
+function keys() {
+	const list = [];
+	const lines = split(fs.readfile(AK) ?? '', '\n');
+	for (let i = 0; i < length(lines); i++) {
+		const l = trim(lines[i]);
+		if (l == '' || substr(l, 0, 1) == '#')
+			continue;
+		const parts = [];
+		for (let w in split(l, ' '))
+			if (w != '')
+				push(parts, w);
+		let at = -1;
+		for (let j = 0; j < length(parts) - 1; j++)
+			if (match(parts[j], /^(ssh-|ecdsa-sha2-|sk-)/)) { at = j; break; }
+		if (at < 0)
+			continue;
+		const m = [ null, parts[at], parts[at + 1], join(' ', slice(parts, at + 2)) ];
+		push(list, { line: i, type: m[1], head: substr(m[2], 0, 10), tail: substr(m[2], -8), comment: m[3] ?? '' });
+	}
+	return list;
+}
+
+function opt(conf, sec, name, def) {
+	uci.load(conf);
+	return uci.get(conf, sec, name) ?? def;
+}
+
+/* SSH (dropbear) の設定の欄。名前のない欄のこともあるので、最初の dropbear の欄を探す (なければ main) */
+let dbName = null;
+function DB() {
+	if (dbName) return dbName;
+	uci.load('dropbear');
+	uci.foreach('dropbear', 'dropbear', s => { dbName ??= s['.name']; });
+	return dbName ?? 'main';
+}
+/* 書く前に欄があるか確かめる (ないと書き込みが何も言わずに効かない) */
+function dbneed() {
+	const n = DB();
+	if (!uci.get('dropbear', n))
+		fail('SSH の設定が見つかりません。');
+	return n;
+}
+
+function root_pw_set() {
+	const lines = split(fs.readfile('/etc/shadow') ?? '', '\n');
+	for (let l in lines) {
+		const f = split(l, ':');
+		if (f[0] == 'root')
+			return length(f[1] ?? '') > 1 && substr(f[1], 0, 1) != '!' && substr(f[1], 0, 1) != '*';
+	}
+	return false;
+}
+
+function listening() {
+	const res = [];
+	for (let l in split(sh('netstat -lntu'), '\n')) {
+		const m = match(l, /^(tcp|udp)[0-9]*\s+[0-9]+\s+[0-9]+\s+(\S+):([0-9]+)\s/);
+		if (!m)
+			continue;
+		const a = m[2];
+		let scope = 'other';
+		if (a == '0.0.0.0' || a == '::' || a == ':::' || a == '*')
+			scope = 'all';
+		else if (index(a, '127.') == 0 || a == '::1')
+			scope = 'local';
+		else if (index(a, '192.168.') == 0 || index(a, '10.') == 0 || match(a, /^172\.(1[6-9]|2[0-9]|3[01])\./) || index(a, 'fe80:') == 0 || index(a, 'fd') == 0)
+			scope = 'lan';
+		else
+			scope = 'global';
+		push(res, { proto: m[1], addr: a, port: +m[3], scope: scope });
+	}
+	return res;
+}
+
+
+function first_port(list, def) {
+	const m = match((list ?? [])[0] ?? '', /:([0-9]+)$/);
+	return m ? +m[1] : def;
+}
+
+const FWD = 'tachigui_fwd_';
+
+/* ポート転送の規則 (TachiGUI が作ったもの)。IPv4 は redirect (DNAT)、IPv6 は WAN → LAN の許可の規則 */
+function fwd_rules() {
+	const res = [];
+	uci.load('firewall');
+	for (let type in [ 'redirect', 'rule' ]) {
+		uci.foreach('firewall', type, function(r) {
+			if (index(r['.name'], FWD) != 0)
+				return;
+			const v4 = type == 'redirect';
+			push(res, {
+				id: substr(r['.name'], length(FWD)), name: substr(r['.name'], length(FWD)),
+				proto: join(' ', r.proto ?? []),
+				ext: (v4 ? r.src_dport : r.dest_port) ?? '',
+				ip: r.dest_ip ?? '',
+				port: r.dest_port ?? '',
+				family: v4 ? 'ipv4' : 'ipv6'
+			});
+		});
+	}
+	return res;
+}
+
+function port_ok(v) { return match('' + v, /^[0-9]+$/) && +v >= 1 && +v <= 65535; }
+
+function range_ok(v) {
+	const m = match(v ?? '', /^([0-9]+)(-([0-9]+))?$/);
+	return !!m && port_ok(m[1]) && (!m[3] || (port_ok(m[3]) && +m[3] >= +m[1]));
+}
+
+function fwd_add(name, proto, ext, ip, port) {
+	if (!match(name ?? '', /^[A-Za-z0-9_-]{1,24}$/))
+		fail('名前は、英数字・ハイフン・アンダースコアで、24 文字までです。');
+	if (!(proto in [ 'tcp', 'udp', 'tcpudp' ]))
+		fail('プロトコルを選んでください。');
+	if (!range_ok(ext))
+		fail('外側のポートは、1〜65535 の番号か、範囲 (例: 8000-8100) で書いてください。');
+	if (!range_ok(port))
+		fail('転送先のポートは、1〜65535 の番号か、範囲 (例: 8000-8100) で書いてください。');
+	const a = iptoarr(ip ?? '');
+	if (!a)
+		fail('転送先のアドレスが、正しくありません。');
+	const v6 = length(a) == 16;
+	/* このルーター自身のアドレスは、転送先にできない (外から、管理画面などに届いてしまうため) */
+	for (let l in split(sh('ip -o addr show'), '
+')) {
+		const f = split(trim(l), /[ 	]+/);
+		const mine = f[3] ? iptoarr(replace(f[3], /\/.*$/, '')) : null;
+		if (mine && join(',', mine) == join(',', a))
+			fail('このルーター自身は、転送先にできません。');
+	}
+	uci.load('firewall');
+	const id = FWD + name;
+	if (uci.get('firewall', id))
+		fail('同じ名前の規則が、すでにあります。');
+	const protos = proto == 'tcpudp' ? [ 'tcp', 'udp' ] : [ proto ];
+	if (v6) {
+		/* IPv6 は、アドレスの変換はなく、WAN から LAN の機器への通信を、許可する */
+		uci.set('firewall', id, 'rule');
+		uci.set('firewall', id, 'name', 'tachigui-fwd-' + name);
+		uci.set('firewall', id, 'src', 'wan');
+		uci.set('firewall', id, 'dest', 'lan');
+		uci.set('firewall', id, 'family', 'ipv6');
+		uci.set('firewall', id, 'proto', protos);
+		uci.set('firewall', id, 'dest_ip', ip);
+		uci.set('firewall', id, 'dest_port', ext);
+		uci.set('firewall', id, 'target', 'ACCEPT');
+	}
+	else {
+		uci.set('firewall', id, 'redirect');
+		uci.set('firewall', id, 'name', 'tachigui-fwd-' + name);
+		uci.set('firewall', id, 'src', 'wan');
+		uci.set('firewall', id, 'dest', 'lan');
+		uci.set('firewall', id, 'family', 'ipv4');
+		uci.set('firewall', id, 'proto', protos);
+		uci.set('firewall', id, 'src_dport', ext);
+		uci.set('firewall', id, 'dest_ip', ip);
+		uci.set('firewall', id, 'dest_port', port);
+		uci.set('firewall', id, 'target', 'DNAT');
+	}
+	uci.save('firewall'); uci.commit('firewall');
+	system('/etc/init.d/firewall reload >/dev/null 2>&1');
+	out({ ok: true });
+}
+
+function fwd_del(name) {
+	uci.load('firewall');
+	const id = FWD + name;
+	if (!uci.get('firewall', id))
+		fail('その規則が見つかりません。');
+	uci.delete('firewall', id);
+	uci.save('firewall'); uci.commit('firewall');
+	system('/etc/init.d/firewall reload >/dev/null 2>&1');
+	out({ ok: true });
+}
+
+/* WAN 側の標準の許可の規則 (OpenWrt が最初から持っているもの)。名前の組で、1 つの項目にする */
+const WAN_RULES = {
+	ping: [ 'Allow-Ping' ],
+	ipsec: [ 'Allow-IPSec-ESP', 'Allow-ISAKMP' ]
+};
+
+function wan_rule_names(key) { return WAN_RULES[key] ?? null; }
+
+function wan_rules_state() {
+	const res = {};
+	uci.load('firewall');
+	for (let key in [ 'ping', 'ipsec' ]) {
+		let on = true, found = 0;
+		uci.foreach('firewall', 'rule', function(r) {
+			if (r.name in WAN_RULES[key]) {
+				found++;
+				if (r.enabled == '0')
+					on = false;
+			}
+		});
+		res[key] = found ? on : null;
+	}
+	return res;
+}
+
+function wan_rule_set(key, value) {
+	const names = wan_rule_names(key);
+	if (!names)
+		fail('未対応の項目です。');
+	let n = 0;
+	uci.load('firewall');
+	uci.foreach('firewall', 'rule', function(r) {
+		if (r.name in names) {
+			uci.set('firewall', r['.name'], 'enabled', (value == 'on' || value == '1') ? '1' : '0');
+			n++;
+		}
+	});
+	if (!n)
+		fail('対象の規則が見つかりません。');
+	uci.save('firewall'); uci.commit('firewall');
+	system('/etc/init.d/firewall reload >/dev/null 2>&1');
+}
+
+function status() {
+	const o = {};
+	o.root_pw = root_pw_set();
+	o.ssh = {
+		password: opt('dropbear', DB(), 'PasswordAuth', 'on') != 'off',
+		root_password: opt('dropbear', DB(), 'RootPasswordAuth', 'on') != 'off',
+		interface: opt('dropbear', DB(), 'Interface', ''),
+		port: +opt('dropbear', DB(), 'Port', '22'),
+		enabled: opt('dropbear', DB(), 'enable', '1') != '0',
+		running: trim(sh('pidof dropbear')) != ''
+	};
+	o.keys = keys();
+	o.http = {
+		redirect_https: opt('uhttpd', 'main', 'redirect_https', '0') == '1',
+		listen_http: uci.get('uhttpd', 'main', 'listen_http') ?? [],
+		listen_https: uci.get('uhttpd', 'main', 'listen_https') ?? [],
+		http_port: first_port(uci.get('uhttpd', 'main', 'listen_http'), 80),
+		https_port: first_port(uci.get('uhttpd', 'main', 'listen_https'), 443),
+		session_time: +opt('luci', 'sauth', 'sessiontime', '3600')
+	};
+	o.ttyd = {
+		installed: fs.access('/etc/init.d/ttyd'),
+		enabled: system('/etc/init.d/ttyd enabled >/dev/null 2>&1') == 0,
+		running: trim(sh('pidof ttyd')) != ''
+	};
+	o.firewall = {
+		input: opt('firewall', '@defaults[0]', 'input', 'REJECT'),
+		guard: index(sh('nft list chain inet fw4 input_lan'), 'tachigui-ipv6-guard') >= 0
+	};
+	o.listening = listening();
+	o.forwards = fwd_rules();
+	o.wan = wan_rules_state();
+	out(o);
+}
+
+function onoff(v) { return v == 'on' || v == '1'; }
+
+function set(name, value) {
+	switch (name) {
+	case 'ssh_password':
+		if (!onoff(value) && length(keys()) == 0)
+			fail('公開鍵が登録されていないため、パスワード認証は無効にできません。先に鍵を登録してください。');
+		uci.load('dropbear');
+		uci.set('dropbear', dbneed(), 'PasswordAuth', onoff(value) ? 'on' : 'off');
+		uci.save('dropbear'); uci.commit('dropbear');
+		system('/etc/init.d/dropbear reload >/dev/null 2>&1');
+		break;
+	case 'ssh_root_password':
+		if (!onoff(value) && length(keys()) == 0)
+			fail('公開鍵が登録されていないため、root のパスワード認証は無効にできません。先に鍵を登録してください。');
+		uci.load('dropbear');
+		uci.set('dropbear', dbneed(), 'RootPasswordAuth', onoff(value) ? 'on' : 'off');
+		uci.save('dropbear'); uci.commit('dropbear');
+		system('/etc/init.d/dropbear reload >/dev/null 2>&1');
+		break;
+	case 'ssh_lan_only':
+		uci.load('dropbear');
+		if (onoff(value))
+			uci.set('dropbear', dbneed(), 'Interface', 'lan');
+		else
+			uci.delete('dropbear', dbneed(), 'Interface');
+		uci.save('dropbear'); uci.commit('dropbear');
+		system('/etc/init.d/dropbear restart >/dev/null 2>&1');
+		break;
+	case 'https_redirect':
+		uci.load('uhttpd');
+		uci.set('uhttpd', 'main', 'redirect_https', onoff(value) ? '1' : '0');
+		uci.save('uhttpd'); uci.commit('uhttpd');
+		system('(sleep 1; /etc/init.d/uhttpd reload) >/dev/null 2>&1 &');
+		break;
+	case 'ttyd':
+		if (!fs.access('/etc/init.d/ttyd'))
+			fail('ttyd はインストールされていません。');
+		if (onoff(value)) {
+			system('/etc/init.d/ttyd enable >/dev/null 2>&1');
+			system('/etc/init.d/ttyd start >/dev/null 2>&1');
+		}
+		else {
+			system('/etc/init.d/ttyd stop >/dev/null 2>&1');
+			system('/etc/init.d/ttyd disable >/dev/null 2>&1');
+		}
+		break;
+	case 'session_time': {
+		const n = +value;
+		if (!(n >= 300 && n <= 86400))
+			fail('有効時間は 300〜86400 秒で指定してください。');
+		uci.load('luci');
+		uci.set('luci', 'sauth', 'sessiontime', '' + n);
+		uci.save('luci'); uci.commit('luci');
+		break;
+	}
+	case 'ssh_enable':
+		uci.load('dropbear');
+		uci.set('dropbear', dbneed(), 'enable', onoff(value) ? '1' : '0');
+		uci.save('dropbear'); uci.commit('dropbear');
+		system((onoff(value) ? '/etc/init.d/dropbear restart' : '/etc/init.d/dropbear stop') + ' >/dev/null 2>&1');
+		break;
+	case 'ssh_port':
+		if (!port_ok(value))
+			fail('ポートは、1〜65535 の番号で指定してください。');
+		if (+value == first_port(uci.get('uhttpd', 'main', 'listen_http'), 80) || +value == first_port(uci.get('uhttpd', 'main', 'listen_https'), 443))
+			fail('管理画面のポートと、重なっています。');
+		uci.load('dropbear');
+		uci.set('dropbear', dbneed(), 'Port', '' + (+value));
+		uci.save('dropbear'); uci.commit('dropbear');
+		system('/etc/init.d/dropbear restart >/dev/null 2>&1');
+		break;
+	case 'wan_ping':
+	case 'wan_ipsec':
+		wan_rule_set(substr(name, 4), value);
+		break;
+	case 'http_ports': {
+		const m = match(value ?? '', /^([0-9]+):([0-9]+)$/);
+		if (!m || !port_ok(m[1]) || !port_ok(m[2]))
+			fail('ポートは、1〜65535 の番号で指定してください。');
+		if (m[1] == m[2])
+			fail('HTTP と HTTPS に、同じポートは使えません。');
+		if (+m[1] == +opt('dropbear', DB(), 'Port', '22') || +m[2] == +opt('dropbear', DB(), 'Port', '22'))
+			fail('SSH のポートと、重なっています。');
+		uci.load('uhttpd');
+		uci.set('uhttpd', 'main', 'listen_http', [ '0.0.0.0:' + m[1], '[::]:' + m[1] ]);
+		uci.set('uhttpd', 'main', 'listen_https', [ '0.0.0.0:' + m[2], '[::]:' + m[2] ]);
+		uci.save('uhttpd'); uci.commit('uhttpd');
+		system('(sleep 2; /etc/init.d/uhttpd restart) >/dev/null 2>&1 &');
+		break;
+	}
+	default:
+		fail('未対応の項目です。');
+	}
+	out({ ok: true });
+}
+
+function key_add(text) {
+	const t = trim(text ?? '');
+	const parts = [];
+	for (let w in split(t, ' '))
+		if (w != '')
+			push(parts, w);
+	if (length(parts) < 2 || !match(parts[0], /^(ssh-|ecdsa-sha2-|sk-)/) || !match(parts[1], /^[A-Za-z0-9+\/=]+$/) || length(parts[1]) < 20 || index(t, '
+') >= 0)
+		fail('公開鍵の形式が正しくありません (例: ssh-ed25519 AAAA… コメント)。');
+	const m = [ null, parts[0], parts[1], join(' ', slice(parts, 2)) ];
+	const cur = fs.readfile(AK) ?? '';
+	if (index(cur, m[2]) >= 0)
+		fail('この鍵は、すでに登録されています。');
+	fs.writefile(AK, (cur != '' && substr(cur, -1) != '\n' ? cur + '\n' : cur) + t + '\n');
+	system('chmod 600 ' + AK + ' >/dev/null 2>&1');
+	out({ ok: true });
+}
+
+function key_del(idx) {
+	const lines = split(fs.readfile(AK) ?? '', '\n');
+	const n = +idx;
+	const list = keys();
+	const found = filter(list, function(k) { return k.line == n; });
+	if (!length(found))
+		fail('その鍵が見つかりません。');
+	const pw = opt('dropbear', DB(), 'PasswordAuth', 'on') != 'off';
+	const rootpw = opt('dropbear', DB(), 'RootPasswordAuth', 'on') != 'off';
+	if (length(list) <= 1 && (!pw || !rootpw))
+		fail('パスワード認証が無効なため、最後の鍵は消せません (SSH で入れなくなります)。先にパスワード認証を有効にしてください。');
+	const keep = [];
+	for (let i = 0; i < length(lines); i++)
+		if (i != n)
+			push(keep, lines[i]);
+	fs.writefile(AK, join('\n', keep));
+	system('chmod 600 ' + AK + ' >/dev/null 2>&1');
+	out({ ok: true });
+}
+
+switch (cmd) {
+case 'status':
+	status();
+	break;
+case 'set':
+	set(ARGV[1], ARGV[2]);
+	break;
+case 'fwd-add':
+	fwd_add(ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5]);
+	break;
+case 'fwd-del':
+	fwd_del(ARGV[1]);
+	break;
+case 'key-add':
+	key_add(ARGV[1]);
+	break;
+case 'key-del':
+	key_del(ARGV[1]);
+	break;
+default:
+	fail('usage');
+}

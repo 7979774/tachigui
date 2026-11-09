@@ -1,0 +1,42 @@
+#!/bin/sh
+[ -f /etc/config/tachigui ] || printf "config ipv6 'main'\n\toption enabled '1'\n" > /etc/config/tachigui
+# rpcd を再起動すると、ログイン中の人が、全員ログアウトになる。プラグインが変わったときだけ、再起動する
+# (権限の定義だけが変わったときは、再読み込み)
+if [ -x /etc/init.d/rpcd ]; then
+	SUM_P=$(cat /usr/share/rpcd/ucode/tachigui.* 2>/dev/null | md5sum | cut -d' ' -f1)
+	SUM_A=$(cat /usr/share/rpcd/acl.d/tachigui.json 2>/dev/null | md5sum | cut -d' ' -f1)
+	OLD=$(cat /tmp/.tachigui-rpcd.sum 2>/dev/null)
+	if [ "$OLD" = "$SUM_P $SUM_A" ]; then :
+	elif [ "${OLD%% *}" = "$SUM_P" ]; then /etc/init.d/rpcd reload >/dev/null 2>&1
+	else /etc/init.d/rpcd restart >/dev/null 2>&1; fi
+	echo "$SUM_P $SUM_A" > /tmp/.tachigui-rpcd.sum
+fi
+# 中継用の dhcp.wan6 を、dnsmasq の担当から外す (回線の RA ごとに、dnsmasq が読み直されて、ログが埋まるため)
+if [ "$(uci -q get dhcp.wan6.master)" = 1 ] && [ -z "$(uci -q get dhcp.wan6.ignore)" ]; then
+	uci set dhcp.wan6.ignore='1' && uci commit dhcp
+	logger -t tachigui "dhcp.wan6 に ignore=1 を足しました (dnsmasq の読み直しを防ぐ)"
+	# 見張りの対象 (procd のトリガー) を作り直すため、再読み込みではなく、再起動する
+	[ -x /etc/init.d/dnsmasq ] && /etc/init.d/dnsmasq restart >/dev/null 2>&1
+fi
+# wan6 (DHCPv6) に ra_holdoff を足す。RA の更新 → odhcpd の再設定 → RS → RA が、3 秒ごとに回り続けるのを止める
+# (wan6 が作り直され、v6プラスは数十秒切れる。map0 は、wan6 の ifup の hotplug で、tachigui-mape-fix が起こし直す)
+if [ "$(uci -q get network.wan6.proto)" = dhcpv6 ] && [ -z "$(uci -q get network.wan6.ra_holdoff)" ]; then
+	uci set network.wan6.ra_holdoff='60' && uci commit network
+	logger -t tachigui "wan6 に ra_holdoff=60 を足しました (RS と RA の繰り返しを止める)"
+	( sleep 2; /etc/init.d/network reload ) >/dev/null 2>&1 &
+fi
+/usr/libexec/tachigui-ipv6 apply >/dev/null 2>&1
+# 追加した背景画像の置き場所 (一覧はこのフォルダから作る)
+mkdir -p /www/ui/bg/user
+# 600 で作られた背景の設定と画像を、ログイン前の画面からも読めるようにする
+/usr/libexec/tachigui-theme-perm
+[ -x /sbin/fw4 ] && /sbin/fw4 reload >/dev/null 2>&1
+# LuCI の更新で /www/index.html が戻ったら、TachiGUI を、既定にし直す
+/usr/libexec/tachigui-default reapply
+# プレフィックスが変わったときの、MAP-E の自動修復を、5 分ごとにも、確かめる
+mkdir -p /etc/crontabs
+grep -q tachigui-mape-fix /etc/crontabs/root 2>/dev/null || echo '*/5 * * * * /usr/libexec/tachigui-mape-fix' >> /etc/crontabs/root
+# 機器が名乗った名前を、連携した AP の名前に自動で書く (AP がなければ何もしない)
+grep -q 'tachigui-wifi names auto' /etc/crontabs/root 2>/dev/null || echo '*/5 * * * * /usr/libexec/tachigui-wifi names auto' >> /etc/crontabs/root
+[ -x /etc/init.d/cron ] && { /etc/init.d/cron enable; /etc/init.d/cron restart; } >/dev/null 2>&1
+exit 0

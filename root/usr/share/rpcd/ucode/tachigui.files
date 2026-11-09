@@ -1,0 +1,487 @@
+'use strict';
+
+import * as fs from 'fs';
+
+/*
+ * TachiGUI ファイルのバックエンド。
+ * シェルを介さず、fs モジュールと、引数配列で呼ぶコマンド (cp / mv / rm / tar / chmod) だけを使う。
+ * (df の結果を読むときだけ、検証・引用符つきのパスを、シェルに渡す)
+ */
+
+const MAX_ENTRIES = 5000;
+const MAX_TEXT = 512 * 1024;
+const PERM_MASK = 4095;   /* 07777 */
+
+/* 消す・動かす・名前を変えることを禁止する場所 (機器を壊さないため) */
+const PROTECTED = [ '/', '/bin', '/sbin', '/lib', '/lib64', '/usr', '/etc', '/overlay', '/rom', '/proc', '/sys', '/dev', '/tmp', '/var', '/www', '/root', '/mnt', '/etc/config', '/usr/bin', '/usr/sbin', '/usr/lib' ];
+
+/* パスの正規化: 絶対パスだけ。// と /./ と末尾の / をまとめ、.. を解決する (リンクはたどらない) */
+function norm(p) {
+	if (type(p) != 'string' || !length(p) || substr(p, 0, 1) != '/' || index(p, '\x00') >= 0)
+		return null;
+
+	let out = [];
+	for (let seg in split(p, '/')) {
+		if (seg == '' || seg == '.')
+			continue;
+		if (seg == '..')
+			pop(out);
+		else
+			push(out, seg);
+	}
+	return '/' + join('/', out);
+}
+
+function parent(p) {
+	let i = rindex(p, '/');
+	return i <= 0 ? '/' : substr(p, 0, i);
+}
+
+function base(p) {
+	return substr(p, rindex(p, '/') + 1);
+}
+
+function join_path(dir, name) {
+	return (dir == '/' ? '' : dir) + '/' + name;
+}
+
+function kind(st) {
+	return st.type == 'directory' ? 'dir' : (st.type == 'link' ? 'link' : (st.type == 'file' ? 'file' : 'other'));
+}
+
+/* "/etc/passwd" と "/etc/group" から、uid / gid を名前にする */
+function id_names(file) {
+	let map = {};
+	let s = fs.readfile(file);
+	if (!s)
+		return map;
+	for (let line in split(s, '\n')) {
+		let f = split(line, ':');
+		if (length(f) >= 3)
+			map[f[2]] = f[0];
+	}
+	return map;
+}
+
+function describe(path, name, st, users, groups) {
+	let e = {
+		name: name,
+		type: kind(st),
+		size: st.size,
+		mtime: st.mtime,
+		mode: sprintf('%04o', st.mode & PERM_MASK),
+		uid: st.uid,
+		gid: st.gid,
+		user: users[st.uid] ?? st.uid,
+		group: groups[st.gid] ?? st.gid
+	};
+	if (st.type == 'link') {
+		e.target = fs.readlink(path);
+		let t = fs.stat(path);
+		e.dir = !!t && t.type == 'directory';
+		if (t)
+			e.size = t.size;
+	}
+	return e;
+}
+
+function fail(msg) {
+	return { ok: false, error: msg };
+}
+
+/* { p: 正規化したパス } か { err: 理由 } を返す */
+function check_target(path) {
+	let p = norm(path);
+	return p ? { p: p } : { err: 'パスが正しくありません。' };
+}
+
+function is_protected(p) {
+	return p in PROTECTED;
+}
+
+function exists(p) {
+	return fs.lstat(p) != null;
+}
+
+/* 引数配列でコマンドを実行する。戻り値は終了コード */
+function run(argv) {
+	return system(argv, 120000);
+}
+
+/* シェル用の引用符つき文字列 */
+function shq(s) {
+	return "'" + replace(s, "'", "'\\''") + "'";
+}
+
+function transfer(args, move) {
+	let paths = args?.paths;
+	let c = check_target(args?.dest);
+	if (c.err)
+		return fail(c.err);
+	let dest = c.p;
+
+	if (type(paths) != 'array' || !length(paths))
+		return fail('対象がありません。');
+
+	let dst = fs.stat(dest);
+	if (!dst || dst.type != 'directory')
+		return fail('宛先がフォルダではありません。');
+
+	let done = 0, errors = [];
+	for (let raw in paths) {
+		let t = check_target(raw);
+		if (t.err) { push(errors, t.err); continue; }
+		let p = t.p;
+		if (!exists(p)) { push(errors, p + ' が見つかりません。'); continue; }
+		if (move && is_protected(p)) { push(errors, p + ' は動かせません。'); continue; }
+
+		/* 自分自身や、自分の中には、置けない */
+		if (dest == p || index(dest + '/', p + '/') == 0) {
+			push(errors, p + ' を、その中には、置けません。');
+			continue;
+		}
+
+		let to = join_path(dest, base(p));
+		if (to == p) { push(errors, base(p) + ': 同じ場所です。'); continue; }
+		if (exists(to) && !args.overwrite) { push(errors, base(p) + ' は、宛先にすでにあります。'); continue; }
+
+		let rc = move ? run([ 'mv', '-f', '--', p, to ]) : run([ 'cp', '-a', '--', p, dest + '/' ]);
+		if (rc == 0)
+			done++;
+		else
+			push(errors, p + ' を処理できませんでした。');
+	}
+	return { ok: !length(errors), done: done, errors: errors, error: length(errors) ? join(' ', errors) : null };
+}
+
+const methods = {
+	/* ディレクトリの一覧 */
+	list: {
+		args: { path: '/' },
+		call: function(request) {
+			let c = check_target(request.args?.path);
+			if (c.err)
+				return fail(c.err);
+			let p = c.p;
+
+			/* リンクの先がディレクトリなら、その本当の場所を使う */
+			let real = fs.realpath(p) ?? p;
+			let st = fs.stat(real);
+			if (!st)
+				return fail('見つかりません: ' + p);
+			if (st.type != 'directory')
+				return fail('ディレクトリではありません: ' + p);
+
+			let names = fs.lsdir(real);
+			if (names == null)
+				return fail('開けません: ' + p);
+
+			let users = id_names('/etc/passwd'), groups = id_names('/etc/group');
+			let entries = [], truncated = false;
+			for (let n in sort(names)) {
+				if (length(entries) >= MAX_ENTRIES) {
+					truncated = true;
+					break;
+				}
+				let full = join_path(real, n);
+				let s = fs.lstat(full);
+				if (s)
+					push(entries, describe(full, n, s, users, groups));
+			}
+
+			return { ok: true, path: p, real: real, parent: parent(p), entries: entries, truncated: truncated };
+		}
+	},
+
+	/* 1 つのファイル / フォルダの詳細 */
+	stat: {
+		args: { path: '/' },
+		call: function(request) {
+			let c = check_target(request.args?.path);
+			if (c.err)
+				return fail(c.err);
+			let p = c.p;
+			let st = fs.lstat(p);
+			if (!st)
+				return fail('見つかりません: ' + p);
+			let e = describe(p, base(p) || '/', st, id_names('/etc/passwd'), id_names('/etc/group'));
+			e.path = p;
+			e.protected = is_protected(p);
+			return { ok: true, entry: e, atime: st.atime, ctime: st.ctime, inode: st.inode, nlink: st.nlink };
+		}
+	},
+
+	/* 空き容量 (path が属するファイルシステム) */
+	diskinfo: {
+		args: { path: '/' },
+		call: function(request) {
+			let c = check_target(request.args?.path);
+			if (c.err)
+				return fail(c.err);
+
+			let f = fs.popen('df -kP ' + shq(c.p) + ' 2>/dev/null', 'r');
+			if (!f)
+				return fail('df を実行できません。');
+			let out = f.read('all');
+			f.close();
+
+			let lines = split(trim(out ?? ''), '\n');
+			if (length(lines) < 2)
+				return fail('容量を取得できません。');
+
+			let cols = split(trim(lines[length(lines) - 1]), /[ \t]+/);
+			if (length(cols) < 6)
+				return fail('容量を取得できません。');
+
+			return {
+				ok: true,
+				fs: cols[0],
+				total: int(cols[1]) * 1024,
+				used: int(cols[2]) * 1024,
+				avail: int(cols[3]) * 1024,
+				mount: join(' ', slice(cols, 5))
+			};
+		}
+	},
+
+	/* テキストの読み込み (編集用) */
+	read_text: {
+		args: { path: '/' },
+		call: function(request) {
+			let c = check_target(request.args?.path);
+			if (c.err)
+				return fail(c.err);
+			let p = c.p;
+			let st = fs.stat(p);
+			if (!st)
+				return fail('見つかりません: ' + p);
+			if (st.type != 'file')
+				return fail('ファイルではありません。');
+
+			let f = fs.open(p, 'r');
+			if (!f)
+				return fail('開けません: ' + p);
+			let data = f.read(MAX_TEXT) ?? '';
+			f.close();
+
+			/* NUL を含むものは、バイナリ */
+			let binary = index(data, '\x00') >= 0;
+			return { ok: true, size: st.size, mtime: st.mtime, mode: sprintf('%04o', st.mode & PERM_MASK), truncated: st.size > MAX_TEXT, binary: binary, content: binary ? '' : data };
+		}
+	},
+
+	/* テキストの保存 (一時ファイルに書いてから、置き換える。権限は元のまま) */
+	write_text: {
+		args: { path: '/', content: '' },
+		call: function(request) {
+			let c = check_target(request.args?.path);
+			if (c.err)
+				return fail(c.err);
+			let p = c.p;
+			let content = request.args?.content;
+			if (type(content) != 'string')
+				return fail('内容がありません。');
+			if (length(content) > MAX_TEXT)
+				return fail('内容が大きすぎます (最大 512KB)。');
+
+			let st = fs.stat(p);
+			if (st && st.type != 'file')
+				return fail('ファイルではありません。');
+
+			let tmp = p + '.fm-tmp';
+			if (fs.writefile(tmp, content) == null)
+				return fail('書き込めません: ' + fs.error());
+			if (st) {
+				fs.chmod(tmp, st.mode & PERM_MASK);
+				fs.chown(tmp, st.uid, st.gid);
+			}
+			if (!fs.rename(tmp, p)) {
+				fs.unlink(tmp);
+				return fail('置き換えられません: ' + fs.error());
+			}
+			return { ok: true, size: length(content) };
+		}
+	},
+
+	mkdir: {
+		args: { path: '/' },
+		call: function(request) {
+			let c = check_target(request.args?.path);
+			if (c.err)
+				return fail(c.err);
+			if (exists(c.p))
+				return fail('同じ名前がすでにあります。');
+			return fs.mkdir(c.p) ? { ok: true } : fail('作れません: ' + fs.error());
+		}
+	},
+
+	newfile: {
+		args: { path: '/' },
+		call: function(request) {
+			let c = check_target(request.args?.path);
+			if (c.err)
+				return fail(c.err);
+			if (exists(c.p))
+				return fail('同じ名前がすでにあります。');
+			return fs.writefile(c.p, '') != null ? { ok: true } : fail('作れません: ' + fs.error());
+		}
+	},
+
+	/* 名前を変える (同じフォルダ内) */
+	rename: {
+		args: { path: '/', name: '' },
+		call: function(request) {
+			let c = check_target(request.args?.path);
+			if (c.err)
+				return fail(c.err);
+			let p = c.p;
+			let name = request.args?.name;
+			if (type(name) != 'string' || !length(name) || index(name, '/') >= 0 || name == '.' || name == '..')
+				return fail('名前に / は使えません。');
+			if (is_protected(p))
+				return fail('このフォルダの名前は変えられません。');
+			let to = join_path(parent(p), name);
+			if (exists(to))
+				return fail('同じ名前がすでにあります。');
+			return fs.rename(p, to) ? { ok: true, path: to } : fail('変更できません: ' + fs.error());
+		}
+	},
+
+	copy: {
+		args: { paths: [], dest: '/', overwrite: false },
+		call: function(request) {
+			return transfer(request.args, false);
+		}
+	},
+
+	move: {
+		args: { paths: [], dest: '/', overwrite: false },
+		call: function(request) {
+			return transfer(request.args, true);
+		}
+	},
+
+	delete: {
+		args: { paths: [] },
+		call: function(request) {
+			let paths = request.args?.paths;
+			if (type(paths) != 'array' || !length(paths))
+				return fail('対象がありません。');
+
+			let done = 0, errors = [];
+			for (let raw in paths) {
+				let t = check_target(raw);
+				if (t.err) { push(errors, t.err); continue; }
+				let p = t.p;
+				if (is_protected(p)) { push(errors, p + ' は削除できません。'); continue; }
+				if (!exists(p)) { push(errors, p + ' が見つかりません。'); continue; }
+				if (run([ 'rm', '-rf', '--', p ]) == 0)
+					done++;
+				else
+					push(errors, p + ' を削除できませんでした。');
+			}
+			return { ok: !length(errors), done: done, errors: errors, error: length(errors) ? join(' ', errors) : null };
+		}
+	},
+
+	chmod: {
+		args: { path: '/', mode: '0644', recursive: false },
+		call: function(request) {
+			let c = check_target(request.args?.path);
+			if (c.err)
+				return fail(c.err);
+			let p = c.p;
+			let mode = request.args?.mode;
+			if (type(mode) != 'string' || !match(mode, /^[0-7]{3,4}$/))
+				return fail('権限は 8 進数 (例: 0644) で指定してください。');
+			if (!exists(p))
+				return fail('見つかりません。');
+
+			if (request.args?.recursive)
+				return run([ 'chmod', '-R', mode, '--', p ]) == 0 ? { ok: true } : fail('変更できませんでした。');
+
+			return fs.chmod(p, int(mode, 8)) ? { ok: true } : fail('変更できません: ' + fs.error());
+		}
+	},
+
+	/* tar.gz にまとめる (dest が空なら、ダウンロード用の一時ファイル) */
+	archive: {
+		args: { paths: [], dest: '' },
+		call: function(request) {
+			let paths = request.args?.paths;
+			if (type(paths) != 'array' || !length(paths))
+				return fail('対象がありません。');
+
+			let list = [];
+			let dir = null;
+			for (let raw in paths) {
+				let t = check_target(raw);
+				if (t.err || !exists(t.p))
+					return fail(t.err ?? (raw + ' が見つかりません。'));
+				if (dir == null)
+					dir = parent(t.p);
+				if (parent(t.p) != dir)
+					return fail('同じフォルダの項目だけ、まとめられます。');
+				push(list, base(t.p));
+			}
+
+			let dest = request.args?.dest;
+			if (!dest) {
+				let n = trim(fs.readfile('/proc/sys/kernel/random/uuid') ?? sprintf('%d', time()));
+				dest = '/tmp/tachigui-dl-' + replace(n, /[^0-9a-f]/g, '') + '.tar.gz';
+			}
+			else {
+				let d = check_target(dest);
+				if (d.err)
+					return fail(d.err);
+				dest = d.p;
+			}
+
+			if (exists(dest))
+				return fail('同じ名前がすでにあります。');
+
+			let argv = [ 'tar', '-czf', dest, '-C', dir, '--' ];
+			for (let n in list)
+				push(argv, n);
+
+			if (run(argv) != 0) {
+				fs.unlink(dest);
+				return fail('圧縮できませんでした。');
+			}
+			return { ok: true, path: dest, name: (length(list) == 1 ? list[0] : (base(dir) || 'archive')) + '.tar.gz' };
+		}
+	},
+
+	/* tar / tar.gz / tgz の展開 */
+	extract: {
+		args: { path: '/', dest: '/' },
+		call: function(request) {
+			let c = check_target(request.args?.path);
+			if (c.err)
+				return fail(c.err);
+			let d = check_target(request.args?.dest);
+			if (d.err)
+				return fail(d.err);
+			if (!match(c.p, /\.(tar|tar\.gz|tgz)$/i))
+				return fail('展開できる形式は、tar / tar.gz / tgz です。');
+			let st = fs.stat(d.p);
+			if (!st || st.type != 'directory')
+				return fail('展開先のフォルダがありません。');
+			let flag = match(c.p, /\.(tar\.gz|tgz)$/i) ? '-xzf' : '-xf';
+			return run([ 'tar', flag, c.p, '-C', d.p ]) == 0 ? { ok: true } : fail('展開できませんでした。');
+		}
+	},
+
+	/* ダウンロード用の一時ファイルを消す (/tmp/tachigui-dl-*.tar.gz だけ) */
+	cleanup: {
+		args: { path: '' },
+		call: function(request) {
+			let p = request.args?.path;
+			if (type(p) == 'string' && match(p, /^\/tmp\/tachigui-dl-[0-9a-f]+\.tar\.gz$/))
+				fs.unlink(p);
+			return { ok: true };
+		}
+	}
+};
+
+return { 'tachigui.files': methods };

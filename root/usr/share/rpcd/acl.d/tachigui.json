@@ -1,0 +1,233 @@
+{
+	"tachigui": {
+		"description": "TachiGUI: network setup, IPv6, status",
+		"read": {
+			"ubus": {
+				"tachigui.network": [
+					"status",
+					"lookup",
+					"check",
+					"install",
+					"ra_probe",
+					"detect",
+					"user_rules",
+					"ifup",
+					"mape",
+					"leds"
+				],
+				"file": [
+					"read",
+					"exec"
+				],
+				"system": [
+					"info",
+					"board"
+				],
+				"network.interface": [
+					"dump"
+				],
+				"luci": [
+					"getTimezones",
+					"getUnixtime"
+				],
+				"network.device": [
+					"status"
+				],
+				"luci-rpc": [
+					"getHostHints",
+					"getDHCPLeases"
+				],
+				"uci": [
+					"get",
+					"changes"
+				],
+				"cgi-io": [
+					"download"
+				],
+				"tachigui.files": [
+					"list",
+					"stat",
+					"diskinfo",
+					"read_text"
+				]
+			},
+			"uci": [
+				"network",
+				"firewall",
+				"dhcp",
+				"system",
+				"tachigui",
+				"luci"
+			],
+			"file": {
+				"/proc/stat": [
+					"read"
+				],
+				"/proc/net/dev": [
+					"read"
+				],
+				"/proc/net/if_inet6": [
+					"read"
+				],
+				"/proc/net/ipv6_route": [
+					"read"
+				],
+				"/proc/sys/net/ipv6/conf/br-lan/accept_ra": [
+					"read"
+				],
+				"/usr/libexec/tachigui-ipv6": [
+					"exec"
+				],
+				"/usr/libexec/tachigui-clients": [
+					"exec"
+				],
+				"/usr/libexec/tachigui-theme-perm": [
+					"exec"
+				],
+				"/usr/libexec/tachigui-diag": [
+					"exec"
+				],
+				"/usr/libexec/tachigui-wifi": [
+					"exec"
+				],
+				"/usr/libexec/tachigui-wlan": [
+					"exec"
+				],
+				"/usr/libexec/tachigui-fan": [
+					"exec"
+				],
+				"/usr/libexec/tachigui-hw": [
+					"exec"
+				],
+				"/bin/df": [
+					"exec"
+				],
+				"/usr/libexec/tachigui-security": [
+					"exec"
+				],
+				"/usr/libexec/tachigui-speedtest": [
+					"exec"
+				],
+				"/tmp/tachigui-st-lan.bin": [
+					"read"
+				],
+				"/": [
+					"read"
+				],
+				"/*": [
+					"read"
+				],
+				"/www/ui/bg": [
+					"list"
+				],
+				"/www/ui/bg/user": [
+					"list"
+				],
+				"/sbin/logread": [
+					"exec"
+				],
+				"/etc/init.d/system": [
+					"exec"
+				],
+				"/etc/init.d/cron": [
+					"exec"
+				],
+				"/etc/init.d/sysntpd": [
+					"exec"
+				],
+				"/etc/init.d/led": [
+					"exec"
+				]
+			},
+			"cgi-io": [
+				"download",
+				"backup"
+			]
+		},
+		"write": {
+			"uci": [
+				"network",
+				"firewall",
+				"dhcp",
+				"system",
+				"tachigui"
+			],
+			"ubus": {
+				"uci": [
+					"set",
+					"add",
+					"delete",
+					"apply",
+					"confirm",
+					"revert",
+					"commit"
+				],
+				"luci": [
+					"setPassword"
+				],
+				"system": [
+					"reboot"
+				],
+				"cgi-io": [
+					"upload"
+				],
+				"tachigui.files": [
+					"mkdir",
+					"newfile",
+					"rename",
+					"copy",
+					"move",
+					"delete",
+					"chmod",
+					"write_text",
+					"archive",
+					"extract",
+					"cleanup"
+				],
+				"file": [
+					"write",
+					"remove"
+				],
+				"session": [
+					"set",
+					"destroy"
+				]
+			},
+			"cgi-io": [
+				"upload"
+			],
+			"file": {
+				"/tmp/tachigui-st-lan-up.bin": [
+					"write"
+				],
+				"/*": [
+					"write"
+				],
+				"/www/ui/theme.json": [
+					"write"
+				],
+				"/www/ui/bg/*": [
+					"write"
+				],
+				"/tmp/.tachigui-wifi-pw": [
+					"write"
+				],
+				"/tmp/.tachigui-wlan-set": [
+					"write"
+				],
+				"/tmp/.tachigui-names-set": [
+					"write"
+				],
+				"/tmp/.tachigui-wlan-local": [
+					"write"
+				],
+				"/www/ui/clients.json": [
+					"write"
+				],
+				"/www/ui/clients-meta.json": [
+					"write"
+				]
+			}
+		}
+	}
+}

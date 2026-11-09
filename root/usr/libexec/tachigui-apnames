@@ -1,0 +1,77 @@
+#!/usr/bin/ucode
+/*
+ * AP の管理画面の名前に、機器が名乗った名前 (DHCP のホスト名) を自動で書くための補助。tachigui-wifi から呼ばれる。
+ *   plan アドレス     AP に書く名前 { MAC: 名前 } を出す。書いたあとの記録は PEND に置く
+ *   commit アドレス   書けたら、PEND を記録に移す
+ * 自動で書いた名前は、ルーターの /etc/tachigui/ap/<アドレス>-auto.json に { MAC: 名前 } で覚える。
+ * AP の名前が記録と同じなら自動の名前、違えば誰かがつけた名前 (AP の管理画面で変えた、など) で、そちらには触らない
+ */
+import { readfile, writefile, rename, unlink } from 'fs';
+import { cursor } from 'uci';
+
+const AUTO = h => '/etc/tachigui/ap/' + h + '-auto.json';
+const PEND = h => '/tmp/.tachigui-apnames-' + h + '.json';
+
+function readJson(path) {
+	let t = readfile(path);
+	if (t == null) return {};
+	try { let j = json(t); return type(j) == 'object' ? j : {}; }
+	catch (e) { warn('tachigui-apnames: ', path, ' を読めません: ', e, '\n'); return {}; }
+}
+/* 記録はフラッシュに書くので、変わったときだけ書く。途中で切れないよう、別の名前に書いてから置き換える */
+function save(path, o) {
+	let t = sprintf('%J', o);
+	if (readfile(path) == t) return;
+	if (!length(keys(o))) { unlink(path); return; }
+	writefile(path + '.new', t) && rename(path + '.new', path);
+}
+/* GL.iNet は " か , を含む名前を捨て、AP 側のスクリプトも制御文字を外すので、同じ形にそろえる (記録と食い違わないように) */
+const clean = s => substr(replace(s, /[",\x01-\x1f\x7f]/g, ''), 0, 64);
+
+/* 機器が名乗った名前 { MAC (小文字): 名前 }。DHCP の貸し出しの記録と、ルーター自身の名前 */
+function hostNames() {
+	let res = {};
+	for (let line in split(readfile('/tmp/dhcp.leases') ?? '', '\n')) {
+		let f = split(line, ' ');
+		if (length(f) >= 4 && f[3] != '*' && length(f[3])) res[lc(f[1])] = clean(split(f[3], '.')[0]);
+	}
+	let mac = trim(readfile('/sys/class/net/br-lan/address') ?? ''), name = cursor().get_first('system', 'system', 'hostname');
+	if (length(mac) && length(name ?? '')) res[lc(mac)] = clean(name);
+	return res;
+}
+
+function plan(host) {
+	let w = readJson('/tmp/tachigui-wifi-' + host + '.json');
+	/* AP を読めていない、古い、名前を読めない (前の版で登録した鍵) なら、何もしない */
+	if (w.ok != true || time() - (w.at ?? 0) > 60 || type(w.names) != 'object') { print('{}\n'); return; }
+	let ap = w.names, rec = readJson(AUTO(host)), next = {}, out = {};
+	/* TachiGUI でつけた名前の機器は、名前を AP に書いているので、自動では書かない */
+	let user = {};
+	for (let k in keys(readJson('/www/ui/clients.json'))) user[lc(k)] = true;
+	/* 記録のうち、AP の名前がまだ自動の名前のままのものだけを残す */
+	for (let mac in keys(rec)) if (!user[mac] && ap[mac] == rec[mac]) next[mac] = rec[mac];
+	let hn = hostNames();
+	for (let mac in keys(hn)) {
+		let h = hn[mac], cur = ap[mac] ?? '';
+		if (user[mac] || !length(h)) continue;
+		if (length(cur) && cur != rec[mac]) continue;     // 誰かがつけた名前
+		next[mac] = h;
+		if (cur != h) out[mac] = h;
+	}
+	writefile(PEND(host), sprintf('%J', next));
+	/* 書くものがなければ、記録だけをここで更新する */
+	if (!length(keys(out))) { save(AUTO(host), next); unlink(PEND(host)); }
+	print(sprintf('%J', out), '\n');
+}
+
+function commit(host) {
+	let p = readJson(PEND(host));
+	unlink(PEND(host));
+	save(AUTO(host), p);
+}
+
+let cmd = ARGV[0], host = ARGV[1];
+if (!match(host ?? '', /^[0-9A-Za-z.:-]+$/)) { warn('tachigui-apnames: アドレスを確かめてください\n'); exit(1); }
+if (cmd == 'plan') plan(host);
+else if (cmd == 'commit') commit(host);
+else { warn('usage\n'); exit(1); }

@@ -1,0 +1,9 @@
+#!/bin/sh
+rm -f /usr/share/nftables.d/chain-pre/input_lan/51-tachigui-ipv6-dns.nft
+[ -x /etc/init.d/rpcd ] && /etc/init.d/rpcd restart >/dev/null 2>&1
+# cron を外す (MAP-E の自動修復、AP の名前)
+[ -f /etc/crontabs/root ] && sed -i '/tachigui-mape-fix/d; /tachigui-wifi names auto/d' /etc/crontabs/root
+# 入口を、LuCI に戻す
+[ -f /www/index.html.luci ] && mv /www/index.html.luci /www/index.html
+rm -f /etc/tachigui.default
+exit 0

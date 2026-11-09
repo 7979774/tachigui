@@ -1,0 +1,66 @@
+#!/bin/sh
+# MAP-E の送信元ポートを、割り当てられた全ポートに、順番に振り分ける。
+# OpenWrt 標準の map.sh は、ポートの塊ごとに、別々のルールを作るため、先頭の塊 (16 ポート) しか使われず、
+# 同時に多くの接続を張ると、詰まる。ここで、先に当たるルールを、別に作って、全ポートを使う。
+# (nft の nat は、最初に当たったルールで決まる。fw4 のルールより、先に評価されるよう、優先順位を上げる)
+
+[ "$(uci -q get network.$INTERFACE.proto)" = "map" ] || exit 0
+
+TABLE=tachigui_mape
+
+case "$ACTION" in
+ifdown)
+	nft delete table inet $TABLE 2>/dev/null
+	exit 0
+	;;
+ifup) ;;
+*) exit 0 ;;
+esac
+
+RULES=/tmp/map-$INTERFACE.rules
+i=0
+while [ ! -s "$RULES" ] && [ $i -lt 10 ]; do sleep 1; i=$((i + 1)); done
+[ -s "$RULES" ] || exit 0
+
+(
+	. "$RULES"
+
+	# 自分のアドレスを持つ規則 (BMR) を探す
+	k=1; found=
+	while [ "$k" -le "${RULE_COUNT:-0}" ]; do
+		eval ip=\$RULE_${k}_IPV4ADDR
+		[ -n "$ip" ] && { found=$k; break; }
+		k=$((k + 1))
+	done
+	[ -n "$found" ] || exit 0
+
+	eval ip=\$RULE_${found}_IPV4ADDR
+	eval sets=\$RULE_${found}_PORTSETS
+	[ -n "$sets" ] || exit 0
+
+	# ポートを、1 つずつに、ばらす
+	n=0; elems=
+	for r in $sets; do
+		a=${r%-*}; b=${r#*-}
+		p=$a
+		while [ "$p" -le "$b" ]; do
+			elems="$elems${elems:+, }$n : $p"
+			n=$((n + 1)); p=$((p + 1))
+		done
+	done
+	[ "$n" -gt 0 ] || exit 0
+
+	nft delete table inet $TABLE 2>/dev/null
+	nft -f - <<EOF
+table inet $TABLE {
+	chain srcnat {
+		type nat hook postrouting priority 90; policy accept;
+		oifname "map-$INTERFACE" meta l4proto { tcp, udp } counter snat ip to $ip : numgen inc mod $n map { $elems }
+		# ICMP (ping) は、識別子 (ID) が、ポートの代わり。ID も、割り当てられたポートの中から選ぶ (BR は、これで、返す先を決める)
+		oifname "map-$INTERFACE" meta l4proto icmp counter snat ip to $ip : numgen inc mod $n map { $elems }
+	}
+}
+EOF
+	logger -t tachigui-mape "$INTERFACE: $ip の $n ポートに、送信元を、振り分けます"
+)
+exit 0

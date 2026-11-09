@@ -1,0 +1,4 @@
+#!/bin/sh
+# LAN が上がったら、このルーター自身の IPv6 (上流の RA を受け取る) 設定を反映する
+[ "$ACTION" = ifup ] && [ "$INTERFACE" = lan ] && /usr/libexec/tachigui-ipv6 apply
+exit 0

@@ -1,0 +1,601 @@
+'use strict';
+
+import { readfile, writefile, lsdir, readlink, stat, mkdir, rename, unlink } from 'fs';
+import { connect } from 'ubus';
+
+const RULES_FILE = '/usr/share/tachigui/rules.json';
+/* 利用者が足したルール。同梱の表の更新で消えないように分ける (/etc/tachigui/ はアップグレード後も残る) */
+const USER_DIR = '/etc/tachigui';
+const USER_RULES = USER_DIR + '/rules-user.json';
+
+/* UI から導入できるパッケージ (固定の許可リスト) */
+const PACKAGES = [ 'map', 'ds-lite', 'ppp-mod-pppoe' ];
+
+function load_user_rules() {
+	let s = readfile(USER_RULES);
+	let d = null;
+	try { d = s ? json(s) : null; } catch (e) { warn('tachigui: 追加ルールを読めません: ' + e + '\n'); }
+	return type(d) == 'array' ? d : [];
+}
+
+/* 追加ルールを先に並べる。同じ長さで一致したら、先のものが選ばれる */
+function load_rules() {
+	let s = readfile(RULES_FILE);
+	let db = s ? json(s) : null;
+	if (db)
+		db.rules = [ ...load_user_rules(), ...db.rules ];
+	return db;
+}
+
+/* "2001:db8:1234:5600::/56" 等 -> 16 バイト配列 (不正なら null) */
+function parse6(s) {
+	s = replace(trim(s ?? ''), /\/.*$/, '');
+	if (!length(s))
+		return null;
+	let a = iptoarr(s);
+	return (a && length(a) == 16) ? a : null;
+}
+
+function parse_len(s) {
+	let m = match(trim(s ?? ''), /\/([0-9]+)$/);
+	return m ? int(m[1]) : null;
+}
+
+/* 先頭 len ビットが一致するか */
+function prefix_match(a, b, len) {
+	let full = len >> 3, rem = len & 7;
+	for (let i = 0; i < full; i++)
+		if (a[i] != b[i])
+			return false;
+	if (rem) {
+		let mask = (0xff << (8 - rem)) & 0xff;
+		if ((a[full] & mask) != (b[full] & mask))
+			return false;
+	}
+	return true;
+}
+
+/* a の start ビット目から len ビット (len <= 31) を整数で取り出す */
+function get_bits(a, start, len) {
+	let v = 0;
+	for (let i = 0; i < len; i++) {
+		let pos = start + i;
+		v = (v << 1) | ((a[pos >> 3] >> (7 - (pos & 7))) & 1);
+	}
+	return v;
+}
+
+function find_rule(rules, a) {
+	let best = null;
+	for (let r in rules) {
+		let rp = parse6(r.p);
+		if (rp && prefix_match(a, rp, r.l) && (!best || r.l > best.l))
+			best = r;
+	}
+	return best;
+}
+
+function ip4_to_int(s) {
+	let v = iptoarr(s);
+	return (v[0] << 24) | (v[1] << 16) | (v[2] << 8) | v[3];
+}
+
+function int_to_ip4(n) {
+	return sprintf('%d.%d.%d.%d', (n >> 24) & 255, (n >> 16) & 255, (n >> 8) & 255, n & 255);
+}
+
+/* ルールと CE の IPv6 プレフィックスから MAP-E のパラメータを求める */
+function compute(a, plen, r) {
+	let psidlen = r.ea - (32 - r.v4l);
+	let need = r.l + r.ea;
+
+	if (plen != null && plen < need)
+		return { error: sprintf('プレフィックスが短すぎます (/%d)。/%d 以上が必要です。', plen, need) };
+
+	let ea = get_bits(a, r.l, r.ea);
+	let psid = ea & ((1 << psidlen) - 1);
+	let suffix = ea >> psidlen;
+	let v4 = int_to_ip4(ip4_to_int(r.v4) | suffix);
+
+	let portbits = 16 - r.off - psidlen;
+	let ranges = [];
+	for (let k = 1; k < (1 << r.off); k++) {
+		let start = (k << (16 - r.off)) | (psid << portbits);
+		push(ranges, [ start, start + (1 << portbits) - 1 ]);
+	}
+
+	return {
+		ok: true,
+		ipv4: v4,
+		psid: psid,
+		psidlen: psidlen,
+		port_count: length(ranges) * (1 << portbits),
+		port_ranges: ranges,
+		map: {
+			peeraddr: r.br,
+			ipaddr: r.v4,
+			ip4prefixlen: r.v4l,
+			ip6prefix: arrtoip(parse6(r.p)),
+			ip6prefixlen: r.l,
+			ealen: r.ea,
+			psidlen: psidlen,
+			offset: r.off
+		}
+	};
+}
+
+function read_net(name, file) {
+	let v = readfile(sprintf('/sys/class/net/%s/%s', name, file));
+	return v ? trim(v) : null;
+}
+
+/* ドライバ名から、基板上の表記 (ETH / SFP) を推定する */
+function port_kind(drv) {
+	if (drv == 'ixgbe' || drv == 'i40e' || drv == 'ice')
+		return 'SFP';
+	if (drv)
+		return 'ETH';
+	return null;
+}
+
+function list_devices() {
+	let out = [], count = {};
+	for (let n in sort(lsdir('/sys/class/net'))) {
+		if (!match(n, /^(eth|en|wan|sfp)/))
+			continue;
+
+		let drv = readlink(sprintf('/sys/class/net/%s/device/driver', n));
+		drv = drv ? replace(drv, /^.*\//, '') : null;
+
+		let kind = port_kind(drv);
+		let label = n;
+		if (kind) {
+			count[kind] = count[kind] ?? 0;
+			label = sprintf('%s%d', kind, count[kind]++);
+		}
+
+		push(out, {
+			name: n,
+			label: label,
+			driver: drv,
+			mac: read_net(n, 'address'),
+			carrier: read_net(n, 'carrier') == '1',
+			speed: int(read_net(n, 'speed') ?? 0),
+			duplex: read_net(n, 'duplex'),
+			master: replace(readlink('/sys/class/net/' + n + '/master') ?? '', /^.*\//, '') || null,
+			rx_bytes: int(read_net(n, 'statistics/rx_bytes') ?? 0),
+			tx_bytes: int(read_net(n, 'statistics/tx_bytes') ?? 0),
+			rx_errors: int(read_net(n, 'statistics/rx_errors') ?? 0),
+			tx_errors: int(read_net(n, 'statistics/tx_errors') ?? 0)
+		});
+	}
+	return out;
+}
+
+function list_ifaces(bus) {
+	let dump = bus?.call('network.interface', 'dump') ?? {};
+	let out = [];
+	for (let i in (dump.interface ?? [])) {
+		if (i.interface == 'loopback')
+			continue;
+		let pd = (i['ipv6-prefix'] ?? [])[0];
+		push(out, {
+			name: i.interface,
+			proto: i.proto,
+			up: !!i.up,
+			device: i.l3_device ?? i.device,
+			ipv4: (i['ipv4-address'] ?? [])[0]?.address,
+			ipv6: (i['ipv6-address'] ?? [])[0]?.address,
+			pd: pd ? sprintf('%s/%d', pd.address, pd.mask) : null,
+			errors: i.errors
+		});
+	}
+	return out;
+}
+
+function pkg_status() {
+	let out = {};
+	for (let p in PACKAGES)
+		out[p] = system([ 'apk', 'info', '-e', p ], 10000) == 0;
+	return out;
+}
+
+function status() {
+	let bus = connect();
+	let ifaces = list_ifaces(bus);
+	let wan6 = filter(ifaces, (i) => i.name == 'wan6')[0];
+	let map0 = filter(ifaces, (i) => i.name == 'map0')[0];
+
+	return {
+		ifaces: ifaces,
+		wan6: {
+			up: !!wan6?.up,
+			device: wan6?.device,
+			pd: wan6?.pd
+		},
+		map: {
+			up: !!map0?.up,
+			errors: map0?.errors,
+			ipv4: map0?.ipv4
+		},
+		devices: list_devices(),
+		packages: pkg_status()
+	};
+}
+
+/* 一時的に、カーネルの RA 受信を有効にして、RA で配られるアドレスとルーターの場所を受け取る */
+function probe_ra(dev) {
+	let base = '/proc/sys/net/ipv6/conf/' + dev + '/';
+	let old = trim(readfile(base + 'accept_ra') ?? '0');
+	writefile(base + 'accept_ra', '2');
+	system([ 'ip', 'link', 'set', 'dev', dev, 'up' ]);
+
+	let found = null;
+	for (let n = 0; n < 14 && !found; n++) {
+		let addr = null, plen = 64, gw = null;
+		for (let l in split(readfile('/proc/net/if_inet6') ?? '', '\n')) {
+			let f = split(trim(l), /\s+/);
+			if (length(f) < 6 || f[5] != dev || f[3] != '00')
+				continue;
+			if (match(f[0], /^(fe80|fc|fd)/i))
+				continue;
+			addr = f[0];
+			plen = hex(f[2]);
+			break;
+		}
+		for (let l in split(readfile('/proc/net/ipv6_route') ?? '', '\n')) {
+			let f = split(trim(l), /\s+/);
+			if (length(f) >= 10 && f[0] == '00000000000000000000000000000000' && f[1] == '00' && f[9] == dev && f[4] != '00000000000000000000000000000000') {
+				gw = f[4];
+				break;
+			}
+		}
+		if (addr && gw)
+			found = { ok: true, addr: addr, plen: plen, gw: gw };
+		else
+			system([ 'sleep', '1' ]);
+	}
+
+	writefile(base + 'accept_ra', old);
+	return found ?? { ok: false, error: '回線から、RA を受け取れませんでした。' };
+}
+
+/* 追加ルールの値を確かめて、保存する形にする。おかしければ { error } を返す */
+function check_rule(u) {
+	let int_of = (v) => (match('' + v, /^[0-9]+$/) ? int(v) : null);
+	let p = parse6(u?.p), br = parse6(u?.br), v4 = iptoarr(u?.v4 ?? '');
+	let l = int_of(u?.l), v4l = int_of(u?.v4l), ea = int_of(u?.ea), off = int_of(u?.off);
+	if (!p || l == null || l < 1 || l > 64)
+		return { error: 'IPv6 プレフィックスを確かめてください (例: 2001:db8:: と 38)。' };
+	if (!v4 || length(v4) != 4 || v4l == null || v4l < 1 || v4l > 32)
+		return { error: 'IPv4 プレフィックスを確かめてください (例: 192.0.2.0 と 22)。' };
+	if (!br)
+		return { error: 'BR のアドレスを確かめてください。' };
+	if (ea == null || off == null)
+		return { error: 'EA ビット長と PSID オフセットは数字で入れてください。' };
+	let psidlen = ea - (32 - v4l);
+	if (psidlen < 0 || l + ea > 64)
+		return { error: 'EA ビット長が IPv4 や IPv6 の長さと合いません。' };
+	if (off < 1 || off + psidlen > 16)
+		return { error: 'PSID オフセットが範囲外です。' };
+	let rule = { p: arrtoip(p), l: l, v4: arrtoip(v4), v4l: v4l, ea: ea, off: off, br: arrtoip(br) };
+	let name = substr(trim(replace(u?.n ?? '', /["\\\n]/g, '')), 0, 32);
+	if (length(name))
+		rule.n = name;
+	return { rule: rule };
+}
+
+function save_user_rules(list) {
+	if (!length(list)) {
+		unlink(USER_RULES);
+		return true;
+	}
+	mkdir(USER_DIR);
+	let tmp = USER_RULES + '.tmp';
+	return writefile(tmp, sprintf('%J\n', list)) != null && rename(tmp, USER_RULES);
+}
+
+/* IPv6 の既定の経路があるか */
+function has_default6() {
+	for (let l in split(readfile('/proc/net/ipv6_route') ?? '', '\n')) {
+		let f = split(trim(l), /\s+/);
+		if (length(f) >= 10 && f[0] == '00000000000000000000000000000000' && f[1] == '00' && f[9] != 'lo')
+			return true;
+	}
+	return false;
+}
+
+/* 16 進 32 桁のアドレス (if_inet6 の形) を、コロンで区切る */
+function hex_to_ip6(h) {
+	let parts = [];
+	for (let i = 0; i < 32; i += 4)
+		push(parts, substr(h, i, 4));
+	return join(':', parts);
+}
+
+function find_aftr(list, a) {
+	for (let e in (list ?? []))
+		for (let net in e.p) {
+			let rp = parse6(net), l = parse_len(net);
+			if (rp && l != null && prefix_match(a, rp, l))
+				return e;
+		}
+	return null;
+}
+
+/*
+ * 回線の種類を調べる。順番: MAP-E のルール、DS-Lite の表、DHCP の IPv4。
+ * 使える IPv6 があればそれを使う。なければ RA を受け取る。
+ */
+function detect(dev) {
+	if (type(dev) != 'string' || !match(dev, /^[a-z0-9._-]+$/))
+		return { ok: false, error: 'デバイス名が正しくありません。' };
+
+	if (read_net(dev, 'carrier') != '1') {
+		system([ 'ip', 'link', 'set', 'dev', dev, 'up' ]);
+		system([ 'sleep', '3' ]);
+		if (read_net(dev, 'carrier') != '1')
+			return { ok: false, error: 'WAN のポートにリンクがありません。ONU をつないでください。' };
+	}
+
+	let db = load_rules();
+	if (!db)
+		return { ok: false, error: 'ルール表が読み込めません。' };
+
+	let ifs = filter(list_ifaces(connect()), (i) => i.device == dev);
+	let prefix = null;
+	for (let i in ifs)
+		if (!prefix && i.pd)
+			prefix = i.pd;
+	for (let i in ifs)
+		if (!prefix && i.ipv6 && !match(i.ipv6, /^(fe80|fc|fd)/i))
+			prefix = i.ipv6 + '/64';
+	if (!prefix) {
+		let ra = probe_ra(dev);
+		if (ra.ok)
+			prefix = hex_to_ip6(ra.addr) + '/' + ra.plen;
+	}
+
+	let a = prefix ? parse6(prefix) : null;
+	if (a) {
+		let r = find_rule(db.rules, a);
+		let res = r ? compute(a, parse_len(prefix), r) : null;
+		if (res?.ok)
+			return { ok: true, kind: 'v6plus', name: r.n, prefix: prefix, ipv4: res.ipv4 };
+		let e = find_aftr(db.aftr, a);
+		if (e)
+			return { ok: true, kind: 'dslite', aftr: e.k, prefix: prefix };
+	}
+
+	/* DHCP: アドレスを受け取れるかだけを見る。-s /bin/true なので、設定は変わらない */
+	for (let i in ifs)
+		if (i.ipv4)
+			return { ok: true, kind: 'dhcp', prefix: prefix };
+	if (system([ 'udhcpc', '-i', dev, '-n', '-q', '-t', '2', '-T', '2', '-s', '/bin/true' ], 10000) == 0)
+		return { ok: true, kind: 'dhcp', prefix: prefix };
+
+	return { ok: true, kind: null, prefix: prefix };
+}
+
+const methods = {
+	status: {
+		call: status
+	},
+
+	/* MAP-E の、いまの割り当て (map.sh が /tmp/map-*.rules に書いたもの) を、読んで返す */
+	mape: {
+		call: function() {
+			let dir = lsdir('/tmp') ?? [];
+			for (let f in dir) {
+				if (!match(f, /^map-[A-Za-z0-9_]+\.rules$/))
+					continue;
+				let txt = readfile('/tmp/' + f) ?? '';
+				let m = match(txt, /RULE_([0-9]+)_IPV4ADDR=([0-9.]+)/);
+				if (!m)
+					continue;
+				let k = m[1];
+				let ports = match(txt, regexp('RULE_' + k + "_PORTSETS='([^']*)'"));
+				let ce6 = match(txt, regexp('RULE_' + k + '_IPV6ADDR=([0-9a-fA-F:]+)'));
+				let br = match(txt, regexp('RULE_' + k + '_BR=([0-9a-fA-F:]+)'));
+				let sets = ports ? filter(split(trim(ports[1]), ' '), (x) => length(x)) : [];
+				let n = 0;
+				for (let r in sets) {
+					let ab = split(r, '-');
+					n += (+ab[1]) - (+ab[0]) + 1;
+				}
+				/* 回線名はルール表から引く (表にない名前は出さない) */
+				let db = ce6 ? load_rules() : null, a = ce6 ? parse6(ce6[1]) : null;
+				let rule = db && a ? find_rule(db.rules, a) : null;
+				return { ok: true, iface: replace(replace(f, /^map-/, ''), /\.rules$/, ''), name: rule ? rule.n : null, ipv4: m[2], ce6: ce6 ? ce6[1] : null, br: br ? br[1] : null, ports: sets, port_count: n };
+			}
+			return { ok: false };
+		}
+	},
+
+	/*
+	 * LED の一覧 (/sys/class/leds)。LED 画面の詳細設定で使う。読むだけ。
+	 * port: その LED が付いているネットワークのポート (分かれば)。speeds: netdev で使える速度 (netdev のときだけ分かる)
+	 */
+	leds: {
+		call: function() {
+			let out = [];
+			for (let n in (lsdir('/sys/class/leds') ?? [])) {
+				let base = '/sys/class/leds/' + n + '/';
+				let rd = (f) => trim(readfile(base + f) ?? '');
+				let trig = split(rd('trigger'), ' ');
+				let active = 'none', triggers = [];
+				for (let t in trig) {
+					if (!length(t))
+						continue;
+					let m = match(t, /^\[(.*)\]$/);
+					if (m) active = m[1];
+					push(triggers, m ? m[1] : t);
+				}
+				/* device は、ポートそのもの (igc: .../net/eth0) の場合と、親の機器 (その下に net/) の場合がある */
+				/* (リンク先は ../../eth0 のような相対パス。ifindex があれば、ポートそのもの) */
+				let link = match(readlink(base + 'device') ?? '', /([^\/]+)$/);
+				let net = (link && readfile(base + 'device/ifindex') != null) ? [ link[1] ] : lsdir(base + 'device/net');
+				let e = {
+					name: n, trigger: active, triggers: triggers,
+					brightness: int(rd('brightness') || '0'), max_brightness: int(rd('max_brightness') || '1'),
+					port: (net && length(net)) ? net[0] : null
+				};
+				if (active == 'netdev') {
+					e.dev = rd('device_name') || null;
+					e.modes = filter([ 'link', 'tx', 'rx', 'link_10', 'link_100', 'link_1000', 'link_2500', 'link_5000', 'link_10000' ], (f) => rd(f) == '1');
+					e.speeds = filter([ '10', '100', '1000', '2500', '5000', '10000' ], (s) => readfile(base + 'link_' + s) != null);
+				}
+				if (active == 'timer') {
+					e.delay_on = int(rd('delay_on') || '0');
+					e.delay_off = int(rd('delay_off') || '0');
+				}
+				push(out, e);
+			}
+			return { leds: sort(out, (a, b) => (a.name < b.name) ? -1 : (a.name > b.name) ? 1 : 0) };
+		}
+	},
+
+	/* IPv4 での疎通確認。固定コマンドのみ実行する */
+	check: {
+		call: function() {
+			let rc = system([ 'ping', '-c', '2', '-W', '3', '1.1.1.1' ], 12000);
+			if (rc != 0)   /* ping を通さない回線でも、HTTP で確かめる (DNS も、一緒に確かめる) */
+				rc = system([ 'uclient-fetch', '-4', '-q', '-T', '5', '-O', '/dev/null', 'http://connectivitycheck.gstatic.com/generate_204' ], 10000);
+			return { ok: rc == 0 };
+		}
+	},
+
+	/*
+	 * 回線から RA (ルーター広告) で配られる /64 と、ルーターの場所を、受け取って返す。
+	 * DHCPv6-PD が出ない回線 (ひかり電話なし等) で使う。一時的に、カーネルの RA 受信を、有効にする。
+	 */
+	ra_probe: {
+		args: { dev: 'eth0' },
+		call: function(request) {
+			let dev = request.args?.dev;
+			if (type(dev) != 'string' || !match(dev, /^[a-z0-9._-]+$/))
+				return { ok: false, error: 'デバイス名が正しくありません。' };
+
+			return probe_ra(dev);
+		}
+	},
+
+	/* 回線の種類を調べて返す。設定は変えない */
+	detect: {
+		args: { dev: 'eth0' },
+		call: function(request) {
+			return detect(request.args?.dev);
+		}
+	},
+
+	/* インターフェースを、確実に、立ち上げ直す (決まった名前だけ) */
+	ifup: {
+		args: { name: '' },
+		call: function(request) {
+			let name = request.args?.name;
+			if (!(name in [ 'map0', 'wan6', 'wan', 'dslite0' ]))
+				return { ok: false, error: 'このインターフェースは、操作できません。' };
+			return { ok: system([ '/sbin/ifup', name ], 20000) == 0 };
+		}
+	},
+
+	/*
+	 * 許可リストにあるパッケージだけ導入する。時間がかかるので裏で動かす (rpcd を止めない)。
+	 * 同じ呼び出しを繰り返して進み具合を見る: 導入中は { running: true }、終わると { ok } を返す
+	 */
+	install: {
+		args: { pkg: '', dev: '' },
+		call: function(request) {
+			let pkg = request.args?.pkg, dev = request.args?.dev;
+			if (!(pkg in PACKAGES))
+				return { ok: false, error: 'このパッケージは導入できません。' };
+
+			let base = '/tmp/.tachigui-pkg-' + pkg;
+			let rc = readfile(base + '.rc');
+			if (rc != null) {
+				system([ 'rm', '-f', base + '.rc', base + '.run' ]);
+				if (trim(rc) != '0')
+					return { ok: false, error: 'パッケージを取得できません。回線の IPv6 接続を確かめてください。詳しくは ' + base + '.log' };
+				/* プロトコル (ds-lite / pppoe) を netifd に認識させる */
+				if (pkg != 'map')
+					system([ '/bin/sh', '-c', '(sleep 2; /etc/init.d/network restart) >/dev/null 2>&1 &' ]);
+				return { ok: true, restarting: pkg != 'map' };
+			}
+
+			/* 途中で止まった印は 10 分で無効にする */
+			let run = stat(base + '.run');
+			if (run && time() - run.mtime < 600)
+				return { running: true };
+
+			/* 回線の IPv6 に経路がなければ、RA を受け取る (IPv4 は、まだ使えないことが多い) */
+			if (type(dev) == 'string' && match(dev, /^[a-z0-9._-]+$/) && !has_default6())
+				probe_ra(dev);
+
+			writefile(base + '.run', '');
+			system([ '/bin/sh', '-c', sprintf('(apk update; apk add %s; echo $? > %s.rc) > %s.log 2>&1 </dev/null &', pkg, base, base) ]);
+			return { running: true };
+		}
+	},
+
+	/*
+	 * 追加ルールの一覧、確認、保存、削除 (action: list / test / add / del)。
+	 * test は、回線のプレフィックスが分かれば、そのルールで求まる IPv4 とポート数も返す
+	 */
+	user_rules: {
+		args: { action: '', rule: {}, prefix: '' },
+		call: function(request) {
+			let action = request.args?.action, list = load_user_rules();
+			if (action == 'list')
+				return { ok: true, rules: list };
+
+			let c = check_rule(request.args?.rule);
+			if (action == 'del') {
+				if (c.error)
+					return { ok: false, error: c.error };
+				list = filter(list, (r) => !(r.p == c.rule.p && r.l == c.rule.l));
+			} else {
+				if (c.error)
+					return { ok: false, error: c.error };
+				if (action == 'test') {
+					let a = parse6(request.args?.prefix), rp = parse6(c.rule.p);
+					if (!a || !prefix_match(a, rp, c.rule.l))
+						return { ok: true, rule: c.rule, preview: null };
+					let res = compute(a, parse_len(request.args?.prefix), c.rule);
+					return res.ok ? { ok: true, rule: c.rule, preview: { prefix: request.args.prefix, ipv4: res.ipv4, psid: res.psid, port_count: res.port_count } } : { ok: false, error: res.error };
+				}
+				if (action != 'add')
+					return { ok: false, error: '操作が正しくありません。' };
+				/* 同じプレフィックスなら置き換える */
+				list = [ c.rule, ...filter(list, (r) => !(r.p == c.rule.p && r.l == c.rule.l)) ];
+			}
+			if (!save_user_rules(list))
+				return { ok: false, error: '保存できませんでした。' };
+			return { ok: true, rules: list };
+		}
+	},
+
+	lookup: {
+		args: { prefix: '' },
+		call: function(request) {
+			let text = request.args?.prefix;
+			let a = parse6(text);
+			if (!a)
+				return { error: 'IPv6 プレフィックスを正しく入力してください。' };
+
+			let db = load_rules();
+			if (!db)
+				return { error: 'ルール表が読み込めません。' };
+
+			let r = find_rule(db.rules, a);
+			if (!r)
+				return { error: 'MAP-E のルールに一致しません。この回線は MAP-E の対象外か、ルール表にない可能性があります。' };
+
+			let res = compute(a, parse_len(text), r);
+			res.rule_source = db.source;
+			res.rule_name = r.n;
+			return res;
+		}
+	}
+};
+
+return { 'tachigui.network': methods };

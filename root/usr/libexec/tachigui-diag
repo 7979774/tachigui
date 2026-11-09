@@ -1,0 +1,20 @@
+#!/bin/sh
+# 接続テストの補助。ubus file exec から呼ばれる。結果はそのまま文字で返す。
+#   ping <宛先> / trace <宛先> / lookup <宛先>
+# 宛先はオプションに見えないよう、使える文字を限る
+HOST="$2"
+case "$HOST" in
+	""|-*|*[!A-Za-z0-9.:_-]*) echo "宛先を確かめてください"; exit 0 ;;
+esac
+case "$HOST" in
+	*:*) FAM=-6 ;;
+	*) FAM=-4 ;;
+esac
+# file exec は 30 秒で打ち切られるので、その前に終わる回数と待ち時間にする
+case "$1" in
+	ping) ping "$FAM" -c 4 -W 2 "$HOST" 2>&1 ;;
+	trace) traceroute "$FAM" -n -m 15 -w 1 -q 1 "$HOST" 2>&1 ;;
+	lookup) nslookup "$HOST" 2>&1 ;;
+	*) echo "使えない操作です" ;;
+esac
+exit 0
